@@ -1,0 +1,44 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "toy-diffusion"
+version = "0.1.0"
+description = "A research framework for testing Flow Matching and DDPM."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "aipracticecafe" }]
+keywords = ["diffusion", "flow-matching", "text-to-image", "pytorch"]
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "Topic :: Scientific/Engineering :: Artificial Intelligence",
+  "Operating System :: OS Independent",
+]
+
+dependencies = [
+  "bitsandbytes==0.46.1",
+  "diffusers==0.37.1",
+  "gradio==6.16.0",
+  "matplotlib==3.10.9",
+  "numpy==2.4.6",
+  "omegaconf==2.3.0",
+  "opencv-contrib-python==4.10.0.84",
+  "opencv-python==4.10.0.84",
+  "Pillow==12.2.0",
+  "safetensors==0.7.0",
+  "scipy==1.17.1",
+  "setuptools==73.0.1",
+  "toml==0.10.2",
+  # "torch-linear-assignment==0.0.6",
+  "tqdm==4.67.1",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["toy_diffusion*"]
+
+[project.urls]
+Homepage = "https://github.com/deeplearningcafe/toy-diffusion"
+Repository = "https://github.com/deeplearningcafe/toy-diffusion.git"

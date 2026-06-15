@@ -1,0 +1,8 @@
+/results
+*__pycache__/
+spiral_p*
+*.egg-info
+/data/*
+/models/
+imgs/
+*.pid

@@ -1,0 +1,67 @@
+experiment:
+  name: "fm_fine_latents"
+  mode: "train"
+  seed: 1255
+
+data:
+  dataset_type: "kanji" # gmm, swiss_roll, images, kanji
+  data_path: "data/danbooru_eva_faces" # For latent/image data
+  image_path: "asuka_ref_clean.jpg"
+  n_samples: 100000 # For synthetic data
+  batch_size: 64
+  num_workers: 6
+  font_path: "/usr/share/fonts/opentype/ipafont-gothic/ipag.ttf"
+  is_latents: True
+  is_conditional: True
+  compute_normalization: True
+  # exclude_tags: ["souryuu asuka langley", "albedo (overlord)"]
+  is_finetune: False
+  finetune_orig_ratio: 0.30
+
+training:
+  epochs: 500
+  lr: 2e-4
+  use_gradient_checkpointing: False
+  device: "cuda"
+  save_dir: "results"
+  log_interval: 1
+  sample_interval: 5
+  perturb_t: 0.5
+  perturb_scale: 0.4
+  start_lr: 1e-6
+  end_lr: 1e-4
+  use_cos_scheduler: False
+  input_perturbation: 0.0
+  weight_fn_name: Null #"min-snr-gamma"
+  use_ema: True
+  ema_decay: 0.999
+  save_interval: 25
+  resume_from_checkpoint: Null
+  use_bitsandbytes: True
+  cfg_dropout_prob: 0.1
+  shuffle_tags: True
+  tag_dropout_prob: 0.05
+
+diffusion:
+  schedule_type: "linear" # linear (Flow Match), ddpm, karras_edm
+  prediction_target: "v" # v, eps, x, consistency
+  loss_target: "v" # v, eps, x, consistency
+  sampler_type: "dpm-solver"
+  use_ot: False
+  train_shift: 4.63
+  sample_shift: 6.93
+  clip_prediction: False
+
+model:
+  model_type: "efficient_unet" # mlp, unet, dit
+  hidden_dim: 128
+  num_layers: 3
+  ch_mult: 2
+  dropout: 0.1
+  compile_model: True
+  vae_pretrained: "kaiyuyue/FLUX.2-dev-vae"
+  cross_attention_dim: 256
+
+sampling:
+  sample_file: "sample.toml"
+  cfg_scale: 6.0
