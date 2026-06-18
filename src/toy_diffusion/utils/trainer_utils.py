@@ -24,7 +24,12 @@ from toy_diffusion.models.mlp import (
 from toy_diffusion.models.unet import Unet
 from toy_diffusion.models.efficient_unet import EfficientUnet
 from toy_diffusion.models.dual_stream import DualStreamDiT
-from toy_diffusion.models.aux_models import EMAModel, SimpleTextEncoder, init_weights
+from toy_diffusion.models.aux_models import (
+    EMAModel,
+    SimpleTextEncoder,
+    init_weights,
+    HFTextEncoder,
+)
 from toy_diffusion.losses import (
     GeneralDiffusionLoss,
     EDMLoss,
@@ -35,6 +40,29 @@ from toy_diffusion.paths.scheduler import LinearSchedule, DDPMSchedule, VESchedu
 
 
 def get_model(config, device):
+    text_enc = None
+    cross_attention_dim = config.get("cross_attention_dim", None)
+
+    if config.get("is_conditional", False):
+        hf_model_id = config.get("hf_text_encoder", None)
+        if hf_model_id:
+            text_enc = HFTextEncoder(
+                model_id=hf_model_id,
+                max_seq_len=config.get("max_seq_len", 256),
+            ).to(device)
+            cross_attention_dim = text_enc.embed_dim
+        else:
+            vocab = config.get("vocab", {"<pad>": 0, "<unk>": 1})
+            max_seq_len = config.get("max_seq_len", 16)
+            if cross_attention_dim is None:
+                cross_attention_dim = 256
+            text_enc = SimpleTextEncoder(
+                vocab=vocab,
+                max_seq_len=max_seq_len,
+                embed_dim=cross_attention_dim,
+                use_pos=config.get("use_pos", False),
+            ).to(device)
+
     if config["model_type"] == "resnet":
         model = ResModel(
             data_dim=config["projection_dim"],
@@ -55,7 +83,6 @@ def get_model(config, device):
         # pixel space 3 channels, latents 4,16 or 32
         block_out_channels = [64, 128, 256, 256]
         in_channels = config.get("in_channels", 3)
-        cross_attention_dim = config.get("cross_attention_dim", None)
         unet = Unet(
             in_channels=in_channels,
             out_channels=in_channels,
@@ -69,27 +96,13 @@ def get_model(config, device):
             dropout=config.get("dropout", 0.1),
         ).to(device)
 
-        if config.get("is_conditional", False):
-            vocab = config.get("vocab", {"<pad>": 0, "<unk>": 1})
-            max_seq_len = config.get("max_seq_len", 16)
-
-            if cross_attention_dim is None:
-                cross_attention_dim = 256
-                unet.cross_attention_dim = cross_attention_dim
-
-            text_enc = SimpleTextEncoder(
-                vocab=vocab,
-                max_seq_len=max_seq_len,
-                embed_dim=cross_attention_dim,
-                use_pos=config.get("use_pos", False),
-            ).to(device)
-
-            model = nn.ModuleDict({"unet": unet, "text_enc": text_enc})
-        else:
-            model = unet
+        model = (
+            nn.ModuleDict({"unet": unet, "text_enc": text_enc})
+            if text_enc is not None
+            else unet
+        )
     elif config["model_type"] == "efficient_unet":
         in_channels = config.get("in_channels", 3)
-        cross_attention_dim = config.get("cross_attention_dim", None)
         unet = EfficientUnet(
             in_channels=in_channels,
             out_channels=in_channels,
@@ -99,27 +112,13 @@ def get_model(config, device):
             dropout=config.get("dropout", 0.1),
         ).to(device)
 
-        if config.get("is_conditional", False):
-            vocab = config.get("vocab", {"<pad>": 0, "<unk>": 1})
-            max_seq_len = config.get("max_seq_len", 16)
-
-            if cross_attention_dim is None:
-                cross_attention_dim = 256
-                unet.cross_attention_dim = cross_attention_dim
-
-            text_enc = SimpleTextEncoder(
-                vocab=vocab,
-                max_seq_len=max_seq_len,
-                embed_dim=cross_attention_dim,
-                use_pos=config.get("use_pos", False),
-            ).to(device)
-
-            model = nn.ModuleDict({"unet": unet, "text_enc": text_enc})
-        else:
-            model = unet
+        model = (
+            nn.ModuleDict({"unet": unet, "text_enc": text_enc})
+            if text_enc is not None
+            else unet
+        )
     elif config["model_type"] == "dual_stream":
         in_channels = config.get("in_channels", 3)
-        cross_attention_dim = config.get("cross_attention_dim", 768)
         unet = DualStreamDiT(
             in_channels=in_channels,
             out_channels=in_channels,
@@ -130,20 +129,11 @@ def get_model(config, device):
             use_checkpointing=config.get("use_gradient_checkpointing", False),
         ).to(device)
 
-        if config.get("is_conditional", False):
-            vocab = config.get("vocab", {"<pad>": 0, "<unk>": 1})
-            max_seq_len = config.get("max_seq_len", 16)
-
-            text_enc = SimpleTextEncoder(
-                vocab=vocab,
-                max_seq_len=max_seq_len,
-                embed_dim=cross_attention_dim,
-                use_pos=config.get("use_pos", False),
-            ).to(device)
-
-            model = nn.ModuleDict({"unet": unet, "text_enc": text_enc})
-        else:
-            model = unet
+        model = (
+            nn.ModuleDict({"unet": unet, "text_enc": text_enc})
+            if text_enc is not None
+            else unet
+        )
 
     elif config.get("model_type") == "ddgan":
         model = nn.ModuleDict(
@@ -228,6 +218,43 @@ def get_schedule_loss(config, model, prediction_target, device):
     return schedule, loss_fn, model
 
 
+def create_optimizer_param_groups(
+    model,
+    lr,
+    weight_decay,
+):
+    param_groups = []
+    no_decay_keywords = ["bias", "norm"]
+    decay, no_decay = [], []
+    for name, param in model.named_parameters():
+        if not param.requires_grad:
+            continue
+        if name.startswith("_orig_mod."):
+            name = name[len("_orig_mod.") :]
+
+        if any(k in name for k in no_decay_keywords):
+            no_decay.append(param)
+        else:
+            decay.append(param)
+    param_groups.append(
+        {
+            "params": decay,
+            "lr": lr,
+            "weight_decay": weight_decay,
+            "name": "decay",
+        }
+    )
+    param_groups.append(
+        {
+            "params": no_decay,
+            "lr": lr,
+            "weight_decay": 0.0,
+            "name": "no_decay",
+        }
+    )
+    return param_groups
+
+
 def create_optim_scheduler(model, len_train_loader: int, conf: omegaconf.DictConfig):
     if conf.get("model_type") == "ddgan":
         optimizer_g = torch.optim.Adam(
@@ -238,20 +265,21 @@ def create_optim_scheduler(model, len_train_loader: int, conf: omegaconf.DictCon
         )
         return {"G": optimizer_g, "D": optimizer_d}, None
 
+    param_groups = create_optimizer_param_groups(
+        model, conf["lr"], conf.get("wd", 0.01)
+    )
     if conf.get("use_bitsandbytes", False):
         import bitsandbytes as bnb
 
         optimizer = bnb.optim.AdamW8bit(
-            model.parameters(),
+            param_groups,
             lr=conf["lr"],
-            weight_decay=conf.get("wd", 0.01),
             betas=(0.9, 0.98),
         )
     else:
         optimizer = torch.optim.AdamW(
-            model.parameters(),
+            param_groups,
             lr=conf["lr"],
-            weight_decay=conf.get("wd", 0.01),
             betas=(0.9, 0.98),
         )
 

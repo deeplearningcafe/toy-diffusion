@@ -3,7 +3,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from toy_diffusion.models.layers import TimeEmbeddings
+from toy_diffusion.models.layers import TimeEmbeddings, TransformerTextAdapter
 
 
 # based on https://github.com/zlab-princeton/i1/blob/main/torch_inference/generate.py
@@ -269,11 +269,13 @@ class DualStreamDiT(nn.Module):
             nn.SiLU(), nn.Linear(hidden_size, hidden_size)
         )
 
-        # 3. Text Adapter
-        self.text_adapter = nn.Sequential(
-            nn.Linear(text_embed_dim, hidden_size),
-            nn.SiLU(),
-            nn.Linear(hidden_size, hidden_size),
+        # 3. Transformer Text Adapter
+        self.text_adapter = TransformerTextAdapter(
+            in_channels=text_embed_dim,
+            hidden_size=hidden_size,
+            num_layers=2,
+            num_attention_heads=num_heads,
+            ffn_expansion_ratio=mlp_ratio,
         )
 
         # 4. 3D RoPE
@@ -372,7 +374,9 @@ class DualStreamDiT(nn.Module):
         time_token = self.time_token_proj(t_emb).unsqueeze(1)  # [B, 1, C]
 
         # 3. Prepare Text Tokens
-        text_tokens = self.text_adapter(encoder_hidden_states)
+        text_tokens = self.text_adapter(
+            encoder_hidden_states, attention_mask=attention_mask
+        )
 
         text_tokens = torch.cat([time_token, text_tokens], dim=1)
 

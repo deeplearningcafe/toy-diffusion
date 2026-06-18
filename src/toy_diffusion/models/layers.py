@@ -625,7 +625,11 @@ class TransformerBlock(nn.Module):
     ):
         if not self.disable_self_attention:
             x_norm = self.norm1(x)
-            hidden_states = x + self.attn1(x_norm, image_rotary_emb=image_rotary_emb)
+            # attention mask if there is NO cross-attention (imgs no mask)
+            self_attn_mask = attention_mask if encoder_hidden_states is None else None
+            hidden_states = x + self.attn1(
+                x_norm, attention_mask=self_attn_mask, image_rotary_emb=image_rotary_emb
+            )
         else:
             hidden_states = x
 
@@ -645,6 +649,44 @@ class TransformerBlock(nn.Module):
             hidden_states = hidden_states + self.ff(hidden_states_norm)
 
         return hidden_states
+
+
+class TransformerTextAdapter(nn.Module):
+    """
+    A strong transformer-based text adapter as proposed in the i1 paper.
+    """
+
+    def __init__(
+        self,
+        in_channels: int,
+        hidden_size: int,
+        num_layers: int = 2,
+        num_attention_heads: int = 8,
+        ffn_expansion_ratio: float = 4.0,
+    ):
+        super().__init__()
+        self.proj_in = nn.Linear(in_channels, hidden_size)
+
+        self.blocks = nn.ModuleList(
+            [
+                TransformerBlock(
+                    in_channels=hidden_size,
+                    cross_attention_dim=None,  # Self-attention only
+                    num_attention_heads=num_attention_heads,
+                    use_checkpointing=False,
+                    disable_self_attention=False,
+                    qk_norm="rms_norm",
+                    ffn_expansion_ratio=ffn_expansion_ratio,
+                )
+                for _ in range(num_layers)
+            ]
+        )
+
+    def forward(self, x, attention_mask=None):
+        x = self.proj_in(x)
+        for block in self.blocks:
+            x = block(x, encoder_hidden_states=None, attention_mask=attention_mask)
+        return x
 
 
 class Transformer2DBlock(nn.Module):

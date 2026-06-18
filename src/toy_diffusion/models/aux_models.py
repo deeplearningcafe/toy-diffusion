@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 import copy
 import contextlib
+from transformers import AutoModelForCausalLM, AutoTokenizer
 
 
 class EMAModel:
@@ -68,6 +69,63 @@ class EMAModel:
                 original_params, uncompiled_model.parameters()
             ):
                 param.data.copy_(orig_param.data)
+
+
+class HFTextEncoder(nn.Module):
+    """
+    A general text encoder using HuggingFace's transformers library.
+    Extracts the final hidden state of a causal LM to leverage implicit
+    positional information inherent in causal attention patterns.
+    """
+
+    def __init__(self, model_id: str, max_seq_len: int = 256):
+        super().__init__()
+        self.max_seq_len = max_seq_len
+        self.tokenizer = AutoTokenizer.from_pretrained(model_id)
+
+        # Ensure pad token is set for batched inference
+        if self.tokenizer.pad_token is None:
+            self.tokenizer.pad_token = self.tokenizer.eos_token or "[PAD]"
+            if self.tokenizer.pad_token_id is None:
+                self.tokenizer.pad_token_id = self.tokenizer.eos_token_id or 0
+
+        # Load model in bfloat16 to save memory
+        self.model = AutoModelForCausalLM.from_pretrained(
+            model_id, torch_dtype=torch.bfloat16
+        )
+        self.model.eval()
+        self.model.requires_grad_(False)
+        self.embed_dim = self.model.config.hidden_size
+
+    def forward(self, inputs):
+        device = next(self.model.parameters()).device
+
+        if isinstance(inputs, (list, tuple)) and isinstance(inputs[0], str):
+            encoded = self.tokenizer(
+                list(inputs),
+                padding="max_length",
+                truncation=True,
+                max_length=self.max_seq_len,
+                return_tensors="pt",
+            ).to(device)
+            input_ids = encoded["input_ids"]
+            attention_mask = encoded["attention_mask"]
+        else:
+            input_ids, attention_mask = inputs
+            input_ids = input_ids.to(device)
+            attention_mask = attention_mask.to(device)
+
+        with torch.no_grad():
+            outputs = self.model(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                output_hidden_states=True,
+                return_dict=True,
+            )
+            # Get the final hidden state from the last layer (before LM head)
+            embeds = outputs.hidden_states[-1]
+
+        return embeds, attention_mask
 
 
 class SimpleTextEncoder(nn.Module):
