@@ -23,6 +23,7 @@ from toy_diffusion.models.mlp import (
 )
 from toy_diffusion.models.unet import Unet
 from toy_diffusion.models.efficient_unet import EfficientUnet
+from toy_diffusion.models.dual_stream import DualStreamDiT
 from toy_diffusion.models.aux_models import EMAModel, SimpleTextEncoder, init_weights
 from toy_diffusion.losses import (
     GeneralDiffusionLoss,
@@ -116,6 +117,34 @@ def get_model(config, device):
             model = nn.ModuleDict({"unet": unet, "text_enc": text_enc})
         else:
             model = unet
+    elif config["model_type"] == "dual_stream":
+        in_channels = config.get("in_channels", 3)
+        cross_attention_dim = config.get("cross_attention_dim", 768)
+        unet = DualStreamDiT(
+            in_channels=in_channels,
+            out_channels=in_channels,
+            hidden_size=config["hidden_dim"],
+            num_heads=config.get("num_heads", 12),
+            text_embed_dim=cross_attention_dim,
+            depth=config["depth"],
+            use_checkpointing=config.get("use_gradient_checkpointing", False),
+        ).to(device)
+
+        if config.get("is_conditional", False):
+            vocab = config.get("vocab", {"<pad>": 0, "<unk>": 1})
+            max_seq_len = config.get("max_seq_len", 16)
+
+            text_enc = SimpleTextEncoder(
+                vocab=vocab,
+                max_seq_len=max_seq_len,
+                embed_dim=cross_attention_dim,
+                use_pos=config.get("use_pos", False),
+            ).to(device)
+
+            model = nn.ModuleDict({"unet": unet, "text_enc": text_enc})
+        else:
+            model = unet
+
     elif config.get("model_type") == "ddgan":
         model = nn.ModuleDict(
             {

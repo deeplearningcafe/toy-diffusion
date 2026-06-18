@@ -8,65 +8,65 @@ cfg_scale = 6
 batch_size = 8
 
 [[prompt.subset]]
-prompt = "general, 1girl, solo, long hair, looking at viewer, blue eyes, orange hair, portrait, souryuu asuka langley"
+prompt = "1girl, souryuu asuka langley, neon genesis evangelion, chigusa minori, general, solo, long hair, looking at viewer, blue eyes, orange hair, portrait, breatss, hair ornament, interface headset"
 seed = 12345
 
 [[prompt.subset]]
-prompt = "sensitive, 1girl, solo, long hair, looking at viewer, blush, smile, simple background, black hair, white background, hair between eyes, jewelry, yellow eyes, horns, necklace, lips, demon girl, demon horns, portrait, slit pupils, albedo (overlord)"
+prompt = "1girl, albedo \\(overlord\\), overlord \\(maruyama\\), sensitive, solo, long hair, looking at viewer, blush, smile, simple background, black hair, white background, hair between eyes, jewelry, yellow eyes, horns, necklace, lips, demon girl, demon horns, portrait, slit pupils"
 seed = 12345
 
 [[prompt.subset]]
-prompt = "general, 1girl, solo, long hair, looking at viewer, blush, smile, blue eyes, long sleeves, ribbon, hair between eyes, closed mouth, school uniform, white hair, ahoge, hair ribbon, sky, day, hand up, cloud, blue sky, red ribbon, eyelashes, window, portrait, close-up"
+prompt = "1girl, alisa mikhailovna kujou, tokidoki bosotto roshia-go de dereru tonari no alya-san, momoko \\(momopoco\\), general, solo, long hair, looking at viewer, blush, smile, blue eyes, long sleeves, ribbon, hair between eyes, closed mouth, school uniform, white hair, ahoge, hair ribbon, sky, day, hand up, cloud, blue sky, red ribbon, eyelashes, window, portrait, close-up"
 seed = 12345
 
 [[prompt.subset]]
-prompt = "general, sensitive, 1girl, solo, long hair, looking at viewer, blush, smile, simple background, hair ornament, white background, ribbon, closed mouth, bare shoulders, purple eyes, white hair, braid, hair ribbon, flower, pointy ears, hair flower, white flower, x hair ornament, portrait, purple ribbon, crown braid, emilia (re:zero)"
+prompt = "girl, miyo \\(blue archive\\), blue archive, sensitive, solo, long hair, breasts, looking at viewer, blush, simple background, large breasts, bow, animal ears, closed mouth, cleavage, bare shoulders, yellow eyes, grey hair, braid, bowtie, grey background, rabbit ears, leotard, strapless, fake animal ears, detached collar, playboy bunny, flying sweatdrops, strapless leotard, green bow, green bowtie"
 seed = 12345
 
 [[prompt.subset]]
-prompt = "sensitive, 1girl, solo, breasts, looking at viewer, blush, dress, closed mouth, cleavage, purple eyes, purple hair, flower, frills, hairband, necktie, blunt bangs, black dress, collar, cosplay, rose, chain, portrait, red flower, black necktie, close-up, lolita fashion, leash, black collar, gothic lolita, bonnet, chain leash, wig, kitagawa marin"
+prompt = "1girl, kurokawa miu \\(yd\\), original, yd \\(orange maru\\), sensitive, solo, long hair, looking at viewer, simple background, shirt, black hair, jewelry, purple eyes, earrings, frills, grey background, black bow, mask, piercing, portrait, ear piercing, pink shirt, mouth mask, surgical mask, black mask, jirai kei"
 seed = 12345
 
 [[prompt.subset]]
-prompt = "general, 1girl, solo, long hair, looking at viewer, smile, closed mouth, twintails, green eyes, white hair, pointy ears, hood, parted bangs, portrait, elf, halloween, halloween costume, ghost costume, frieren"
+prompt = "1girl, frieren, sousou no frieren, general, solo, long hair, looking at viewer, smile, closed mouth, twintails, green eyes, collarbone, white hair, braid, pointy ears, grey background, twin braids, parted bangs, thick eyebrows, portrait, elf, hair over shoulder"
+seed = 12078
+
+[[prompt.subset]]
+prompt = "1girl, souryuu asuka langley, neon genesis evangelion, sensitive, solo, long hair, blue eyes, simple background, white background, hair between eyes, closed mouth, jewelry, heart, earrings, frills, choker, orange hair, looking to the side, maid, maid headdress, portrait, hand on own face, head rest, hand on own cheek, heart earrings, interface headset"
 seed = 12345
 
 [[prompt.subset]]
-prompt = "general, 1girl, solo, long hair, blue eyes, simple background, white background, hair between eyes, closed mouth, jewelry, heart, earrings, frills, choker, orange hair, looking to the side, maid, maid headdress, portrait, hand on own face, head rest, hand on own cheek, heart earrings, interface headset, souryuu asuka langley"
+prompt = "1girl, souryuu asuka langley, neon genesis evangelion, toosaka asagi, general, long hair, blue eyes, orange hair, solo, alternate costume, animal ears, fur trim, jingle bell, print kimono, looking at viewer, bare shoulders, kitsune, hair ornament, kemonomimi mode, interface headset"
 seed = 12345
 
 [[prompt.subset]]
-prompt = "general, 1girl, solo, long hair, looking at viewer, smile, closed mouth, twintails, green eyes, collarbone, white hair, braid, pointy ears, grey background, twin braids, parted bangs, thick eyebrows, portrait, elf, hair over shoulder, frieren"
+prompt = "1girl, 2b \\(nier:automata\\), nier \\(series\\), general, solo, black hairband, blindfold, clothing cutout, covered eyes, hairband, mole, mole under mouth, portrait, short hair, white hair, black dress, dress, expressionless"
 seed = 12345
 
 [[prompt.subset]]
-prompt = "general, 1girl, solo, black hairband, blindfold, clothing cutout, covered eyes, hairband, mole, mole under mouth, portrait, short hair, white hair, dress, 2b (nier:automata)"
+prompt = "1girl,  reze \\(chainsaw man\\), general, solo, black choker, green eyes, single hair bun, tongue out, hair between eyes, white shirt, portrait, bare shoulders, short hair, black hair, tongue, choker"
 seed = 12345
 
 [[prompt.subset]]
-prompt = "general, 1girl, solo, black choker, green eyes, single hair bun, tongue out, hair between eyes, white shirt, portrait, reze (chainsaw man)"
+prompt = "1girl, hoshino ai, oshi no ko, general, solo, dress, idol, looking at viewer, pink dress, star-shaped pupils, star \\(symbol\\), tongue out, v, tongue, purple eyes, long hair, pruple hair, one side up, hair between eyes, swept bangs, rabbit hair ornament, pink dress"
 seed = 12345
 
 [[prompt.subset]]
-prompt = "general, 1girl, solo, dress, idol, looking at viewer, pink dress, star-shaped pupils, star \\(symbol\\), tongue out, v, hoshino ai \\(oshi no ko\\)"
+prompt = "1girl, ayanami rei, neon genesis evangelion, general, solo, blue hair, short hair, red eyes, white bodysuit, interface headset, plugsuit"
 seed = 12345
 
 [[prompt.subset]]
-prompt = "general, 1girl, solo, blue hair, short hair, red eyes, white bodysuit, interface headset, plugsuit, ayanami rei"
+prompt = "1girl, souryuu asuka langley, neon genesis evangelion, ebifurya, general, solo, animal hat, eyepatch, long hair, blue eyes, red bodysuit, looking at viewer"
 seed = 12345
 
 [[prompt.subset]]
-prompt = "general, 1girl, solo, animal hat, eyepatch, long hair, blue eyes, red bodysuit, looking at viewer, souryuu asuka langley"
+prompt = "1girl, oyama mahiro, onii-chan wa oshimai!, general, solo, ahoge, brown eyes, hair between eyes, pink hair, v, blue background, white shirt, long hair"
 seed = 12345
 
 [[prompt.subset]]
-prompt = "general, 1girl, solo, ahoge, brown eyes, hair between eyes, pink hair, v, blue background, white shirt, long hair, oyama mahiro"
+prompt = "1girl, arima kana, oshi no ko, ebifurya, general, solo, blunt bangs, hand on own face, red eyes, red hair, short hair, white background, looking at viewer, red ribbon, school uniform"
 seed = 12345
 
 [[prompt.subset]]
-prompt = "general, 1girl, solo, blunt bangs, hand on own face, red eyes, red hair, short hair, white background, looking at viewer, red ribbon, school uniform, arima kana"
-seed = 12345
-
-[[prompt.subset]]
-prompt = "general, 1girl, solo, grey hair, male focus, looking to the side, red background, red eyes, short hair, plugsuit, black bodysuit, nagisa kaworu"
+prompt = "1girl, souryuu asuka langley, neon genesis evangelion, yd \\(orange maru\\), blue eyes, bodysuit, breasts, brown hair, collarbone, expressionless, eyepatch, headgear, knee up, long hair, looking at viewer, mecha pilot suit, medium breasts, multicolored bodysuit, one eye covered, plugsuit \\(evangelion\\), red bodysuit, solo"
 seed = 12345

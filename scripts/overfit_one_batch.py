@@ -60,8 +60,8 @@ def run_overfit_batch_experiment(args):
 
     # update conf for overfit batch
     # 5k steps
-    config["epochs"] = 5000
-    config["sample_interval"] = 500
+    config["epochs"] = 3000
+    config["sample_interval"] = 250
     config["save_interval"] = 200000
 
     logging.info("\n=== Step 1: Pretraining Base FM Model (1-Rectified Flow) ===")
@@ -203,17 +203,6 @@ def run_overfit_batch_experiment(args):
         timestamp=timestamp,
         save_interval=config["save_interval"],
     )
-
-    evaluate_model(
-        trainer,
-        config["prediction_target"],
-        save_dir,
-        f"overfit_batch_{config['schedule_type']}_{config['prediction_target']}",
-        data_shape,
-        fid_samples=512,
-        batch_size=batch_size * 6,
-    )
-
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
