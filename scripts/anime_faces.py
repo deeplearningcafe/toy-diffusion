@@ -67,6 +67,7 @@ def run_anime_faces_experiment(args):
     is_conditional = config.get("is_conditional", False)
     dataset = dataset = ImageDataset(
         root_dir=config["data_path"],
+        load_into_ram=config["load_into_ram"],
         num_workers=config["num_workers"],
         resize_dim=config.get("resize_dim", None),
         conditional=is_conditional,
@@ -77,6 +78,7 @@ def run_anime_faces_experiment(args):
         shuffle_tags=config.get("shuffle_tags", False),
         cfg_dropout_prob=config.get("cfg_dropout_prob", 0.0),
         tag_dropout_prob=config.get("tag_dropout_prob", 0.0),
+        use_short_prompts=config.get("use_short_prompts", False),
     )
 
     config["vae_scale"] = dataset.vae_scale

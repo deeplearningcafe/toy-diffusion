@@ -6,8 +6,13 @@ import torch
 import torchvision
 from tqdm import tqdm
 from diffusers import AutoencoderKL
+from torch.utils.data import DataLoader
 
 from toy_diffusion.data.image import ImageDataset
+
+SEED = 42
+torch.manual_seed(SEED)
+np.random.seed(SEED)
 
 
 def main():
@@ -51,6 +56,17 @@ def main():
         action="store_true",
         help="Store the latents in float16 precision.",
     )
+    parser.add_argument(
+        "--load_into_ram",
+        action="store_true",
+        help="Store the images in ram",
+    )
+    parser.add_argument(
+        "--num_workers",
+        type=int,
+        default=4,
+        help="Number of workers for DataLoader.",
+    )
     args = parser.parse_args()
 
     device = args.device
@@ -58,6 +74,7 @@ def main():
     # Setup Mixed Precision
     capability = torch.cuda.get_device_capability() if device == "cuda" else (0, 0)
     autocast_dtype = torch.float32
+    print(f"Autocast {autocast_dtype} and dtype {dtype}")
 
     if device == "cuda":
         if capability[0] >= 8:
@@ -73,6 +90,7 @@ def main():
         args.vae_pretrained, torch_dtype=dtype, cache_dir="models"
     ).to(device)
     vae.eval()
+    vae = torch.compile(vae)
 
     vae_scale = 1.0  # getattr(vae.config, "scaling_factor", 1.0)
     vae_shift = 0.0  # getattr(vae.config, "shift_factor", 0.0)
@@ -83,6 +101,7 @@ def main():
     print("Loading dataset...")
     dataset = ImageDataset(
         root_dir=args.data_dir,
+        load_into_ram=args.load_into_ram,
         dtype=torch.float32,
         resize_dim=args.resize_dim,
         conditional=False,
@@ -93,6 +112,18 @@ def main():
         print("No images found in the dataset.")
         return
 
+    loader_workers = 0 if args.load_into_ram else args.num_workers
+
+    dataloader = DataLoader(
+        dataset,
+        batch_size=args.batch_size,
+        shuffle=False,
+        num_workers=loader_workers,
+        pin_memory=(device == "cuda"),
+        persistent_workers=(loader_workers > 0),
+        drop_last=False,
+    )
+
     autocast_enabled = True
 
     if args.show_sample:
@@ -100,7 +131,13 @@ def main():
         os.makedirs("results", exist_ok=True)
 
         idx = random.randint(0, max(0, len(dataset) - args.batch_size))
-        sample_tensors = dataset.tensors_list[idx : idx + args.batch_size]
+        if args.load_into_ram:
+            sample_tensors = dataset.tensors_list[idx : idx + args.batch_size]
+        else:
+            sample_tensors = []
+            for i in range(idx, idx + args.batch_size):
+                sample_tensors.append(dataset[i])
+
         sample_tensor = torch.stack(sample_tensors).to(device, dtype=dtype)
 
         with torch.no_grad():
@@ -135,6 +172,7 @@ def main():
         os.makedirs("results", exist_ok=True)
         dataset = ImageDataset(
             root_dir=args.data_dir,
+            load_into_ram=args.load_into_ram,
             dtype=torch.float32,
             resize_dim=args.resize_dim,
             conditional=False,
@@ -144,7 +182,12 @@ def main():
             compute_normalization=False,
         )
         idx = random.randint(0, max(0, len(dataset) - args.batch_size))
-        sample_tensors = dataset.tensors_list[idx : idx + args.batch_size]
+        if args.load_into_ram:
+            sample_tensors = dataset.tensors_list[idx : idx + args.batch_size]
+        else:
+            sample_tensors = []
+            for i in range(idx, idx + args.batch_size):
+                sample_tensors.append(dataset[i])
         sample_tensor = torch.stack(sample_tensors).to(device, dtype=dtype)
 
         with torch.no_grad():
@@ -169,12 +212,9 @@ def main():
         torchvision.utils.save_image(comparison, save_path, nrow=len(sample_tensors))
         print(f"Saved sample grid to {save_path}")
 
-    for i in tqdm(range(0, len(dataset), args.batch_size), desc="Encoding to latents"):
-        batch_tensors = dataset.tensors_list[i : i + args.batch_size]
-        batch_paths = dataset.img_paths[i : i + args.batch_size]
-
-        batch_tensor = torch.stack(batch_tensors).to(device, dtype=dtype)
-
+    processed_count = 0
+    for batch_tensor in tqdm(dataloader, desc="Encoding to latents"):
+        batch_tensor = batch_tensor.to(device, dtype=dtype)
         with torch.no_grad():
             with torch.autocast(
                 device_type=device,
@@ -197,6 +237,13 @@ def main():
         if args.half:
             latents = latents.to(torch.float16)
         latents = latents.numpy()
+
+        # Retrieve paths matching the exact items in the current batch
+        batch_size_actual = batch_tensor.shape[0]
+        batch_paths = dataset.img_paths[
+            processed_count : processed_count + batch_size_actual
+        ]
+        processed_count += batch_size_actual
 
         for latent, p in zip(latents, batch_paths):
             npz_path = p.with_suffix(".npz")

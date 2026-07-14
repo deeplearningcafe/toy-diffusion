@@ -404,7 +404,7 @@ def gpu_setup(device: str = "cuda"):
             autocast_dtype = torch.float32
 
         if capability[0] >= 7 and capability[0] < 8:
-            autocast_dtype = torch.float32
+            autocast_dtype = torch.float16
             torch.set_float32_matmul_precision("high")
             print("Using high precision for float32 matmul (tensor cores).")
         elif capability[0] >= 8:

@@ -17,6 +17,8 @@ data:
   # exclude_tags: ["souryuu asuka langley", "albedo (overlord)"]
   is_finetune: False
   finetune_orig_ratio: 0.30
+  use_short_prompts: True
+  load_into_ram: True
 
 training:
   epochs: 500
@@ -41,6 +43,7 @@ training:
   cfg_dropout_prob: 0.1
   shuffle_tags: True
   tag_dropout_prob: 0.05
+  gradient_accumulation_steps: 1
 
 diffusion:
   schedule_type: "linear" # linear (Flow Match), ddpm, karras_edm

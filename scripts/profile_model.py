@@ -4,6 +4,7 @@ import torch
 import numpy as np
 from omegaconf import OmegaConf
 from torch.utils.data import DataLoader
+import gc
 
 from toy_diffusion.data.image import ImageDataset, TieredBatchSampler
 from toy_diffusion.utils.trainer_utils import (
@@ -55,6 +56,7 @@ def run_profiling(args):
     is_conditional = config.get("is_conditional", False)
     dataset = ImageDataset(
         root_dir=config["data_path"],
+        load_into_ram=args.load_into_ram,
         num_workers=config.get("num_workers", 4),
         resize_dim=config.get("resize_dim", None),
         conditional=is_conditional,
@@ -62,6 +64,7 @@ def run_profiling(args):
         shuffle_tags=config.get("shuffle_tags", False),
         cfg_dropout_prob=config.get("cfg_dropout_prob", 0.0),
         tag_dropout_prob=config.get("tag_dropout_prob", 0.0),
+        use_short_prompts=config.get("use_short_prompts", False),
     )
 
     if config.get("is_latents"):
@@ -287,6 +290,10 @@ def profile_train_memory_flops(
                 f"Time: {iter_time_ms:.2f}ms, "
                 f"Peak Mem: {peak_mem_mb:.2f}MB"
             )
+
+    del x, loss
+    gc.collect()
+    torch.cuda.empty_cache()
 
     # flops must be after bc flop_counter is adding overhead to compiler
     print("Counting FLOPs...")
@@ -515,8 +522,12 @@ if __name__ == "__main__":
     parser.add_argument(
         "--compile", action="store_true", help="Compile the model before profiling."
     )
+    parser.add_argument(
+        "--load_into_ram",
+        action="store_true",
+        help="Store the images in ram",
+    )
     parser.add_argument("opts", nargs=argparse.REMAINDER)
     args = parser.parse_args()
 
     run_profiling(args)
-

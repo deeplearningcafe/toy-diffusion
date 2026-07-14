@@ -66,6 +66,7 @@ class ImageDataset(Dataset):
         dtype=torch.float32,
         num_workers: int = 4,
         resize_dim: int = None,
+        load_into_ram: bool = True,
         conditional: bool = False,
         is_latents: bool = False,
         vae_scale: float = 1.0,
@@ -77,9 +78,11 @@ class ImageDataset(Dataset):
         shuffle_tags: bool = False,
         cfg_dropout_prob: float = 0.0,
         tag_dropout_prob: float = 0.0,
+        use_short_prompts: bool = False,
     ) -> None:
         self.root_dir = Path(root_dir)
         self.num_workers = num_workers
+        self.load_into_ram = load_into_ram
         self.conditional = conditional
         self.is_latents = is_latents
         self.vae_scale = vae_scale
@@ -91,6 +94,7 @@ class ImageDataset(Dataset):
         self.shuffle_tags = shuffle_tags
         self.cfg_dropout_prob = cfg_dropout_prob
         self.tag_dropout_prob = tag_dropout_prob
+        self.use_short_prompts = use_short_prompts
 
         print(
             f"Using shuffling {self.shuffle_tags}, cfg prob: {self.cfg_dropout_prob} and tag prob: {self.tag_dropout_prob}"
@@ -131,13 +135,18 @@ class ImageDataset(Dataset):
 
         # Check if text files exist
         if self.conditional:
-            has_txt = any(p.with_suffix(".txt").exists() for p in self.img_paths)
+            has_txt = any(
+                p.with_name(f"{p.stem}_short.txt").exists()
+                or p.with_suffix(".txt").exists()
+                for p in self.img_paths
+            )
             if not has_txt and len(self.img_paths) > 0:
                 raise FileNotFoundError(
-                    "Conditional is True but no .txt files were found."
+                    "Conditional is True but no .txt or _short.txt files were found."
                 )
 
-        self.tensors_list, self.img_paths = self._load_to_ram()
+        if self.load_into_ram:
+            self.tensors_list, self.img_paths = self._load_to_ram()
 
         if self.conditional:
             self._build_vocab()
@@ -164,7 +173,14 @@ class ImageDataset(Dataset):
         normal_paths = []
 
         for p in all_paths:
-            txt_path = p.with_suffix(".txt")
+            short_txt = p.with_name(f"{p.stem}_short.txt")
+            standard_txt = p.with_suffix(".txt")
+            txt_path = (
+                short_txt
+                if (self.use_short_prompts and short_txt.exists())
+                else standard_txt
+            )
+
             if txt_path.exists():
                 with open(txt_path, "r", encoding="utf-8") as f:
                     prompt = f.read().strip().lower()
@@ -258,7 +274,13 @@ class ImageDataset(Dataset):
         """
         prompt = ""
         if self.conditional:
-            txt_path = p.with_suffix(".txt")
+            short_txt = p.with_name(f"{p.stem}_short.txt")
+            standard_txt = p.with_suffix(".txt")
+            txt_path = (
+                short_txt
+                if (self.use_short_prompts and short_txt.exists())
+                else standard_txt
+            )
             if txt_path.exists():
                 with open(txt_path, "r", encoding="utf-8") as f:
                     prompt = f.read().strip()
@@ -382,50 +404,68 @@ class ImageDataset(Dataset):
                 norm_lat = self.vae_scale * (latent - self.vae_shift)
                 self.tensors_list[i] = norm_lat
 
+    def _create_attention_mask(self, prompt):
+        if self.cfg_dropout_prob > 0.0 and random.random() < self.cfg_dropout_prob:
+            tags = []
+        else:
+            tags = [t.strip() for t in prompt.split(",") if t.strip()]
+
+            if len(tags) > 5:
+                first_tags = tags[:5]
+                middle_tags = tags[5:]
+
+                if self.tag_dropout_prob > 0.0:
+                    middle_tags = [
+                        t
+                        for t in middle_tags
+                        if random.random() >= self.tag_dropout_prob
+                    ]
+
+                if self.shuffle_tags:
+                    random.shuffle(middle_tags)
+
+                tags = first_tags + middle_tags
+
+        unk_id = self.vocab.get("<unk>", 1)
+        ids = [self.vocab.get(tag, unk_id) for tag in tags]
+        ids = ids[: self.max_seq_len]
+
+        pad_id = self.vocab.get("<pad>", 0)
+        padded_ids = ids + [pad_id] * (self.max_seq_len - len(ids))
+
+        tokens_tensor = torch.tensor(padded_ids, dtype=torch.long)
+
+        # Attention Mask
+        not_pad_mask = tokens_tensor != pad_id
+        shifted_mask = torch.roll(not_pad_mask, shifts=1, dims=0)
+        shifted_mask[0] = True
+        attention_mask = not_pad_mask | shifted_mask
+        return tokens_tensor, attention_mask
+
     def __len__(self):
-        return len(self.tensors_list)
+        if self.load_into_ram:
+            return len(self.tensors_list)
+        else:
+            return len(self.img_paths)
 
     def __getitem__(self, idx):
-        # TODO: cache instead of prompts?
-        if self.conditional:
-            data, prompt = self.tensors_list[idx]
+        if self.load_into_ram:
+            # TODO: cache instead of prompts?
+            if self.conditional:
+                data, prompt = self.tensors_list[idx]
+                tokens_tensor, attention_mask = self._create_attention_mask(prompt)
 
-            if self.cfg_dropout_prob > 0.0 and random.random() < self.cfg_dropout_prob:
-                tags = []
-            else:
-                tags = [t.strip() for t in prompt.split(",") if t.strip()]
+                return data, tokens_tensor, attention_mask
 
-                if len(tags) > 5:
-                    first_tags = tags[:5]
-                    middle_tags = tags[5:]
+            return self.tensors_list[idx]
+        else:
+            path = self.img_paths[idx]
+            entry = self.load_entry(path)
+            data = entry[0]
+            if self.conditional:
+                prompt = entry[1]
+                tokens_tensor, attention_mask = self._create_attention_mask(prompt)
 
-                    if self.tag_dropout_prob > 0.0:
-                        middle_tags = [
-                            t
-                            for t in middle_tags
-                            if random.random() >= self.tag_dropout_prob
-                        ]
+                return data, tokens_tensor, attention_mask
 
-                    if self.shuffle_tags:
-                        random.shuffle(middle_tags)
-
-                    tags = first_tags + middle_tags
-
-            unk_id = self.vocab.get("<unk>", 1)
-            ids = [self.vocab.get(tag, unk_id) for tag in tags]
-            ids = ids[: self.max_seq_len]
-
-            pad_id = self.vocab.get("<pad>", 0)
-            padded_ids = ids + [pad_id] * (self.max_seq_len - len(ids))
-
-            tokens_tensor = torch.tensor(padded_ids, dtype=torch.long)
-
-            # Attention Mask
-            not_pad_mask = tokens_tensor != pad_id
-            shifted_mask = torch.roll(not_pad_mask, shifts=1, dims=0)
-            shifted_mask[0] = True
-            attention_mask = not_pad_mask | shifted_mask
-
-            return data, tokens_tensor, attention_mask
-
-        return self.tensors_list[idx]
+            return data

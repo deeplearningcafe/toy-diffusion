@@ -28,6 +28,7 @@ try:
         patch_unsloth_smart_gradient_checkpointing,
         patch_torch_compile,
         patch_compiled_autograd,
+        CPUGradientAccumulator,
     )
 except Exception as e:
     logging.info(f"Can't use unsloth gradient checkpoint {e}")
@@ -55,8 +56,16 @@ class Trainer:
         self.autocast_dtype = (
             gpu_setup(self.device) if self.autocast_enabled else torch.float32
         )
+        self.scaler = (
+            torch.amp.GradScaler("cuda")
+            if self.autocast_dtype == torch.float16
+            else None
+        )
         self.grad_clip = self.config.get("grad_clip", 1.0)
         self.is_latents = self.config.get("is_latents", False)
+        self.gradient_accumulation_steps = self.config.get(
+            "gradient_accumulation_steps", 1
+        )
 
         self.vae = None
         if self.is_latents and self.vae is None:
@@ -84,6 +93,16 @@ class Trainer:
             len_train_loader=len(dataset) / config.get("batch_size", 64),
             conf=config,
         )
+        self.grad_offloader = None
+        if self.gradient_accumulation_steps > 1:
+            target_model = (
+                self.model["unet"]
+                if (
+                    isinstance(self.model, torch.nn.ModuleDict) and "unet" in self.model
+                )
+                else self.model
+            )
+            self.grad_offloader = CPUGradientAccumulator(target_model)
 
         self.use_ema_config = config.get("use_ema", True)
         self.ema_start_epoch = config.get("ema_start_epoch", 0)
@@ -119,6 +138,7 @@ class Trainer:
         if hasattr(torch, "compile") and config.get("compile_model", True):
             logging.info("Compiling model with torch.compile for faster training...")
             patch_torch_compile()
+            patch_compiled_autograd()
             if isinstance(self.model, torch.nn.ModuleDict) and "unet" in self.model:
                 self.model["unet"] = torch.compile(self.model["unet"])
                 # skip text encoder compile
@@ -183,17 +203,12 @@ class Trainer:
             return loss_d + loss_g
 
         else:
-            self.optimizer.zero_grad()
-            loss.backward()
-
-            # TODO: print/log it
-            if self.grad_clip > 0.0:
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_clip)
-            self.optimizer.step()
-            if self.scheduler is not None:
-                self.scheduler.step()
-
-            self.ema.update(self.model)
+            scaled_loss = loss / self.gradient_accumulation_steps
+            if self.scaler:
+                self.scaler.scale(scaled_loss).backward()
+            else:
+                scaled_loss.backward()
+            del scaled_loss
 
             return loss
 
@@ -203,9 +218,36 @@ class Trainer:
         """
         self.model.train()
         total_loss = torch.tensor([0.0], device=self.device)
-        for batch in tqdm(dataloader):
+        self.optimizer.zero_grad(set_to_none=True)
+
+        for step, batch in tqdm(enumerate(dataloader), total=len(dataloader)):
             loss = self.train_step(batch)
             total_loss += loss.detach()
+
+            if self.config.get("model_type") == "ddgan":
+                continue
+
+            is_update_step = (step + 1) % self.gradient_accumulation_steps == 0 or (
+                step + 1
+            ) == len(dataloader)
+
+            if is_update_step:
+                if self.grad_offloader is None:
+                    if self.grad_clip > 0.0:
+                        torch.nn.utils.clip_grad_norm_(
+                            self.model.parameters(), self.grad_clip
+                        )
+                    self.optimizer.step()
+                else:
+                    self.grad_offloader.finalize_and_step(
+                        self.optimizer, scaler=self.scaler, max_norm=self.grad_clip
+                    )
+
+                self.optimizer.zero_grad(set_to_none=True)
+                if self.scheduler is not None:
+                    self.scheduler.step()
+
+                self.ema.update(self.model)
 
         return total_loss.item() / len(dataloader)
 
