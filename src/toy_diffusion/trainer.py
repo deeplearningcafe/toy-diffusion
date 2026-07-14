@@ -233,11 +233,20 @@ class Trainer:
 
             if is_update_step:
                 if self.grad_offloader is None:
-                    if self.grad_clip > 0.0:
-                        torch.nn.utils.clip_grad_norm_(
-                            self.model.parameters(), self.grad_clip
-                        )
-                    self.optimizer.step()
+                    if self.scaler:
+                        if self.grad_clip > 0.0:
+                            self.scaler.unscale_(self.optimizer)
+                            norm_unet = torch.nn.utils.clip_grad_norm_(
+                                self.unet.parameters(), self.grad_clip
+                            )
+                        self.scaler.step(self.optimizer)
+                        self.scaler.update()
+                    else:
+                        if self.grad_clip > 0.0:
+                            torch.nn.utils.clip_grad_norm_(
+                                self.model.parameters(), self.grad_clip
+                            )
+                        self.optimizer.step()
                 else:
                     self.grad_offloader.finalize_and_step(
                         self.optimizer, scaler=self.scaler, max_norm=self.grad_clip
