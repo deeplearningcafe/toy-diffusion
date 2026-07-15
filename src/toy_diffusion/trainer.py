@@ -237,7 +237,7 @@ class Trainer:
                         if self.grad_clip > 0.0:
                             self.scaler.unscale_(self.optimizer)
                             norm_unet = torch.nn.utils.clip_grad_norm_(
-                                self.unet.parameters(), self.grad_clip
+                                self.model.parameters(), self.grad_clip
                             )
                         self.scaler.step(self.optimizer)
                         self.scaler.update()

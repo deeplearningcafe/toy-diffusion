@@ -328,14 +328,19 @@ def save_checkpoint(
     save_dir = os.path.join(output_dir, f"epoch_{epoch}")
     os.makedirs(save_dir, exist_ok=True)
 
-    # Extract the original model if it was compiled to avoid saving '_orig_mod.' prefixes
-    uncompiled_model = getattr(model, "_orig_mod", model)
+    state_dict = model.state_dict()
+    clean_state_dict = {k.replace("_orig_mod.", ""): v for k, v in state_dict.items()}
+
     model_path = os.path.join(save_dir, "model.safetensors")
-    save_file(uncompiled_model.state_dict(), model_path)
+    save_file(clean_state_dict, model_path)
 
     if ema is not None and ema.use_ema and ema.ema_model is not None:
+        ema_state_dict = ema.ema_model.state_dict()
+        clean_ema_state_dict = {
+            k.replace("_orig_mod.", ""): v for k, v in ema_state_dict.items()
+        }
         ema_path = os.path.join(save_dir, "ema_model.safetensors")
-        save_file(ema.ema_model.state_dict(), ema_path)
+        save_file(clean_ema_state_dict, ema_path)
 
     torch.save(optimizer.state_dict(), os.path.join(save_dir, "optimizer.pt"))
 
