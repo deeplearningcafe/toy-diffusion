@@ -204,6 +204,39 @@ class DualStreamDiTBlock(nn.Module):
         else:
             return module(*args, **kwargs)
 
+    def _run_skip(
+        self,
+        image_tokens: torch.Tensor,
+        text_tokens: torch.Tensor,
+        skip: tuple[torch.Tensor, torch.Tensor],
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Encapsulates skip connection calculations to checkpoint them."""
+        img_out = self.skip_linear_image(torch.cat([image_tokens, skip[0]], dim=-1))
+        txt_out = self.skip_linear_text(torch.cat([text_tokens, skip[1]], dim=-1))
+        return img_out, txt_out
+
+    def _run_post_attn(
+        self,
+        image_tokens: torch.Tensor,
+        text_tokens: torch.Tensor,
+        image_attn: torch.Tensor,
+        text_attn: torch.Tensor,
+        text_mask: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Groups all post-attention calculations to discard intermediates."""
+        image_tokens = image_tokens + self.norm3(image_attn)
+        text_tokens = text_tokens + self.norm3(text_attn)
+
+        # inner sandwich norms (norm2 -> FFN -> norm4)
+        image_mlp = self.norm4(self.mlp_image(self.norm2(image_tokens)))
+        text_mlp = self.norm4(self.mlp_text(self.norm2(text_tokens)))
+
+        image_tokens = image_tokens + image_mlp
+        text_tokens = text_tokens + text_mlp
+
+        text_tokens = text_tokens * text_mask[:, :, None].to(text_tokens.dtype)
+        return image_tokens, text_tokens
+
     def forward(
         self,
         image_tokens: torch.Tensor,
@@ -214,11 +247,8 @@ class DualStreamDiTBlock(nn.Module):
         skip: tuple[torch.Tensor, torch.Tensor] = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if self.use_skip and skip is not None:
-            image_tokens = self._checkpoint(
-                self.skip_linear_image, torch.cat([image_tokens, skip[0]], dim=-1)
-            )
-            text_tokens = self._checkpoint(
-                self.skip_linear_text, torch.cat([text_tokens, skip[1]], dim=-1)
+            image_tokens, text_tokens = self._checkpoint(
+                self._run_skip, image_tokens, text_tokens, skip
             )
 
         image_attn, text_attn = self.attn(
@@ -229,19 +259,15 @@ class DualStreamDiTBlock(nn.Module):
             text_mask,
         )
 
-        image_tokens = image_tokens + self.norm3(image_attn)
-        text_tokens = text_tokens + self.norm3(text_attn)
+        image_tokens, text_tokens = self._checkpoint(
+            self._run_post_attn,
+            image_tokens,
+            text_tokens,
+            image_attn,
+            text_attn,
+            text_mask,
+        )
 
-        image_mlp_in = self._checkpoint(self.norm2, image_tokens)
-        text_mlp_in = self._checkpoint(self.norm2, text_tokens)
-
-        image_mlp_out = self._checkpoint(self.mlp_image, image_mlp_in)
-        text_mlp_out = self._checkpoint(self.mlp_text, text_mlp_in)
-
-        image_tokens = image_tokens + self.norm4(image_mlp_out)
-        text_tokens = text_tokens + self.norm4(text_mlp_out)
-
-        text_tokens = text_tokens * text_mask[:, :, None].to(text_tokens.dtype)
         return image_tokens, text_tokens
 
 

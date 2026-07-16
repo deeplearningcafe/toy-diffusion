@@ -330,6 +330,7 @@ class Trainer:
         sample_result = self.sample(
             self.prediction_target, 16, num_steps=num_steps, return_traj=return_traj
         )
+        torch.cuda.empty_cache()
 
         if return_traj:
             final_samples, traj = sample_result
