@@ -663,9 +663,11 @@ class TransformerTextAdapter(nn.Module):
         num_layers: int = 2,
         num_attention_heads: int = 8,
         ffn_expansion_ratio: float = 4.0,
+        use_checkpointing: bool = True,
     ):
         super().__init__()
         self.proj_in = nn.Linear(in_channels, hidden_size)
+        self.use_checkpointing = use_checkpointing
 
         self.blocks = nn.ModuleList(
             [
@@ -673,7 +675,7 @@ class TransformerTextAdapter(nn.Module):
                     in_channels=hidden_size,
                     cross_attention_dim=None,  # Self-attention only
                     num_attention_heads=num_attention_heads,
-                    use_checkpointing=False,
+                    use_checkpointing=self.use_checkpointing,
                     disable_self_attention=False,
                     qk_norm="rms_norm",
                     ffn_expansion_ratio=ffn_expansion_ratio,

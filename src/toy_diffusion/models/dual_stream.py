@@ -175,9 +175,11 @@ class DualStreamDiTBlock(nn.Module):
         mlp_ratio: float = 4.0,
         eps: float = 1e-5,
         use_skip: bool = False,
+        use_checkpointing: bool = True,
     ) -> None:
         super().__init__()
         self.use_skip = use_skip
+        self.use_checkpointing = use_checkpointing
         if use_skip:
             self.skip_linear_image = nn.Linear(2 * hidden_size, hidden_size)
             self.skip_linear_text = nn.Linear(2 * hidden_size, hidden_size)
@@ -194,6 +196,14 @@ class DualStreamDiTBlock(nn.Module):
         self.mlp_image = SwiGLUFFN(hidden_size, hidden_features)
         self.mlp_text = SwiGLUFFN(hidden_size, hidden_features)
 
+    def _checkpoint(self, module, *args, **kwargs):
+        if self.use_checkpointing:
+            return torch.utils.checkpoint.checkpoint(
+                module, *args, **kwargs, use_reentrant=False
+            )
+        else:
+            return module(*args, **kwargs)
+
     def forward(
         self,
         image_tokens: torch.Tensor,
@@ -203,13 +213,12 @@ class DualStreamDiTBlock(nn.Module):
         text_mask: torch.Tensor,
         skip: tuple[torch.Tensor, torch.Tensor] = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-
         if self.use_skip and skip is not None:
-            image_tokens = self.skip_linear_image(
-                torch.cat([image_tokens, skip[0]], dim=-1)
+            image_tokens = self._checkpoint(
+                self.skip_linear_image, torch.cat([image_tokens, skip[0]], dim=-1)
             )
-            text_tokens = self.skip_linear_text(
-                torch.cat([text_tokens, skip[1]], dim=-1)
+            text_tokens = self._checkpoint(
+                self.skip_linear_text, torch.cat([text_tokens, skip[1]], dim=-1)
             )
 
         image_attn, text_attn = self.attn(
@@ -223,10 +232,14 @@ class DualStreamDiTBlock(nn.Module):
         image_tokens = image_tokens + self.norm3(image_attn)
         text_tokens = text_tokens + self.norm3(text_attn)
 
-        image_tokens = image_tokens + self.norm4(
-            self.mlp_image(self.norm2(image_tokens))
-        )
-        text_tokens = text_tokens + self.norm4(self.mlp_text(self.norm2(text_tokens)))
+        image_mlp_in = self._checkpoint(self.norm2, image_tokens)
+        text_mlp_in = self._checkpoint(self.norm2, text_tokens)
+
+        image_mlp_out = self._checkpoint(self.mlp_image, image_mlp_in)
+        text_mlp_out = self._checkpoint(self.mlp_text, text_mlp_in)
+
+        image_tokens = image_tokens + self.norm4(image_mlp_out)
+        text_tokens = text_tokens + self.norm4(text_mlp_out)
 
         text_tokens = text_tokens * text_mask[:, :, None].to(text_tokens.dtype)
         return image_tokens, text_tokens
@@ -276,6 +289,7 @@ class DualStreamDiT(nn.Module):
             num_layers=2,
             num_attention_heads=num_heads,
             ffn_expansion_ratio=mlp_ratio,
+            use_checkpointing=self.use_checkpointing,
         )
 
         # 4. 3D RoPE
@@ -287,17 +301,34 @@ class DualStreamDiT(nn.Module):
         num_in_blocks = depth // 2
         self.in_blocks = nn.ModuleList(
             [
-                DualStreamDiTBlock(hidden_size, num_heads, mlp_ratio, eps=eps)
+                DualStreamDiTBlock(
+                    hidden_size,
+                    num_heads,
+                    mlp_ratio,
+                    eps=eps,
+                    use_checkpointing=self.use_checkpointing,
+                )
                 for _ in range(num_in_blocks)
             ]
         )
 
-        self.mid_block = DualStreamDiTBlock(hidden_size, num_heads, mlp_ratio, eps=eps)
+        self.mid_block = DualStreamDiTBlock(
+            hidden_size,
+            num_heads,
+            mlp_ratio,
+            eps=eps,
+            use_checkpointing=self.use_checkpointing,
+        )
 
         self.out_blocks = nn.ModuleList(
             [
                 DualStreamDiTBlock(
-                    hidden_size, num_heads, mlp_ratio, eps=eps, use_skip=True
+                    hidden_size,
+                    num_heads,
+                    mlp_ratio,
+                    eps=eps,
+                    use_skip=True,
+                    use_checkpointing=self.use_checkpointing,
                 )
                 for _ in range(num_in_blocks)
             ]
@@ -347,14 +378,6 @@ class DualStreamDiT(nn.Module):
 
         return caption_ids, image_ids
 
-    def _checkpoint(self, module, *args, **kwargs):
-        if self.use_checkpointing:
-            return torch.utils.checkpoint.checkpoint(
-                module, *args, **kwargs, use_reentrant=False
-            )
-        else:
-            return module(*args, **kwargs)
-
     def forward(
         self,
         x: torch.Tensor,
@@ -396,13 +419,16 @@ class DualStreamDiT(nn.Module):
 
         skips = []
         for block in self.in_blocks:
-            image_tokens, text_tokens = self._checkpoint(
-                block, image_tokens, text_tokens, image_freqs, text_freqs, text_mask
+            image_tokens, text_tokens = block(
+                image_tokens,
+                text_tokens,
+                image_freqs,
+                text_freqs,
+                text_mask,
             )
             skips.append((image_tokens, text_tokens))
 
-        image_tokens, text_tokens = self._checkpoint(
-            self.mid_block,
+        image_tokens, text_tokens = self.mid_block(
             image_tokens,
             text_tokens,
             image_freqs,
@@ -412,8 +438,7 @@ class DualStreamDiT(nn.Module):
 
         for block in self.out_blocks:
             skip_tensors = skips.pop()
-            image_tokens, text_tokens = self._checkpoint(
-                block,
+            image_tokens, text_tokens = block(
                 image_tokens,
                 text_tokens,
                 image_freqs,
