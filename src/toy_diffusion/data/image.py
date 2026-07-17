@@ -79,6 +79,7 @@ class ImageDataset(Dataset):
         cfg_dropout_prob: float = 0.0,
         tag_dropout_prob: float = 0.0,
         use_short_prompts: bool = False,
+        tiers_len: list = None,
     ) -> None:
         self.root_dir = Path(root_dir)
         self.num_workers = num_workers
@@ -95,6 +96,7 @@ class ImageDataset(Dataset):
         self.cfg_dropout_prob = cfg_dropout_prob
         self.tag_dropout_prob = tag_dropout_prob
         self.use_short_prompts = use_short_prompts
+        self.tiers_len = None
 
         print(
             f"Using shuffling {self.shuffle_tags}, cfg prob: {self.cfg_dropout_prob} and tag prob: {self.tag_dropout_prob}"
@@ -227,6 +229,7 @@ class ImageDataset(Dataset):
         """
         print("Building vocabulary from prompts...")
         self.vocab = {"<pad>": 0, "<unk>": 1}
+        # ignore, max is always biggest tier
         self.max_seq_len = 0
         prompt_lengths = []
         for item in self.tensors_list:
@@ -238,8 +241,6 @@ class ImageDataset(Dataset):
                 if tag not in self.vocab:
                     self.vocab[tag] = len(self.vocab)
 
-        # minimum sequence length for stability
-        self.max_seq_len = max(16, self.max_seq_len)
         print(
             f"Vocabulary size: {len(self.vocab)}, Max sequence length: {self.max_seq_len}"
         )
@@ -252,15 +253,27 @@ class ImageDataset(Dataset):
         print(f"Prompt Length Stats - Mean: {mean_len:.2f}, Median: {median_len:.2f}")
         print(f"Quantiles (25%, 50%, 75%, 90%, 95%, 99%): {quantiles}")
 
-        self.tiers = {24: [], 52: []}
-        for idx, length in enumerate(prompt_lengths):
-            if length <= 24:
-                self.tiers[24].append(idx)
-            else:
-                self.tiers[52].append(idx)
+        # TODO: create tiers dynamically using 99 QT
+        if self.tiers_len:
+            tier_1_boundary = self.tiers_len[0]
+            tier_2_boundary = self.tiers_len[1]
+        else:
+            tier_1_boundary = int(median_len)
+            tier_2_boundary = int(quantiles[-1])
+            self.tiers_len = [tier_1_boundary, tier_2_boundary]
 
-        print(f"Tier <= 24: {len(self.tiers[24])} samples")
-        print(f"Tier <= 52: {len(self.tiers[52])} samples")
+        # minimum sequence length for stability
+        self.max_seq_len = max(16, self.tiers_len[-1])
+
+        self.tiers = {tier_1_boundary: [], tier_2_boundary: []}
+        for idx, length in enumerate(prompt_lengths):
+            if length <= tier_1_boundary:
+                self.tiers[tier_1_boundary].append(idx)
+            else:
+                self.tiers[tier_2_boundary].append(idx)
+
+        print(f"Tier <= {tier_1_boundary}: {len(self.tiers[tier_1_boundary])} samples")
+        print(f"Tier <= {tier_2_boundary}: {len(self.tiers[tier_2_boundary])} samples")
 
     def load_entry(self, p: Path):
         """

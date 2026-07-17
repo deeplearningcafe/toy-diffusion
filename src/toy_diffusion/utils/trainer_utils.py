@@ -30,6 +30,10 @@ from toy_diffusion.models.aux_models import (
     init_weights,
     HFTextEncoder,
 )
+from toy_diffusion.models.sprint import (
+    SprintLuminaNextDit,
+    SprintDualStreamDiT,
+)
 from toy_diffusion.losses import (
     GeneralDiffusionLoss,
     EDMLoss,
@@ -60,6 +64,7 @@ def get_model(config, device):
                 vocab=vocab,
                 max_seq_len=max_seq_len,
                 embed_dim=cross_attention_dim,
+                tiers_len=config["tiers_len"],
                 use_pos=config.get("use_pos", False),
             ).to(device)
 
@@ -128,6 +133,43 @@ def get_model(config, device):
             depth=config["depth"],
             use_checkpointing=config.get("use_gradient_checkpointing", False),
         ).to(device)
+
+        model = (
+            nn.ModuleDict({"unet": unet, "text_enc": text_enc})
+            if text_enc is not None
+            else unet
+        )
+    elif config["model_type"] in ["sprint_single", "sprint_dual"]:
+        in_channels = config.get("in_channels", 3)
+        if config["model_type"] == "sprint_single":
+            unet = SprintLuminaNextDit(
+                in_channels=in_channels,
+                hidden_size=config["hidden_dim"],
+                depth=config["depth"],
+                num_attention_heads=config.get("num_heads", 16),
+                cross_attention_dim=cross_attention_dim,
+                encoder_depth=config.get("encoder_depth", 2),
+                decoder_depth=config.get("decoder_depth", 2),
+                drop_ratio=config.get("drop_ratio", 0.75),
+                residual_type=config.get("residual_type", "concat_linear"),
+                cfg_mask_prob=config.get("cfg_mask_prob", 0.1),
+            ).to(device)
+        else:
+            unet = SprintDualStreamDiT(
+                in_channels=in_channels,
+                out_channels=in_channels,
+                hidden_size=config["hidden_dim"],
+                depth=config["depth"],
+                num_heads=config.get("num_heads", 12),
+                text_embed_dim=cross_attention_dim,
+                use_checkpointing=config.get("use_gradient_checkpointing", False),
+                encoder_depth=config.get("encoder_depth", 2),
+                decoder_depth=config.get("decoder_depth", 2),
+                drop_ratio=config.get("drop_ratio", 0.75),
+                drop_target=config.get("drop_target", "image"),
+                residual_type=config.get("residual_type", "concat_linear"),
+                cfg_mask_prob=config.get("cfg_mask_prob", 0.1),
+            ).to(device)
 
         model = (
             nn.ModuleDict({"unet": unet, "text_enc": text_enc})

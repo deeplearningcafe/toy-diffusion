@@ -139,6 +139,7 @@ class SimpleTextEncoder(nn.Module):
         vocab: dict,
         max_seq_len: int,
         embed_dim: int,
+        tiers_len: list = [24, 52],
         use_pos: bool = False,
     ):
         super().__init__()
@@ -148,6 +149,7 @@ class SimpleTextEncoder(nn.Module):
         self.unk_id = vocab.get("<unk>", 1)
         self.embedding = nn.Embedding(len(vocab), embed_dim, padding_idx=self.pad_id)
         self.pos_embedding = nn.Embedding(max_seq_len, embed_dim) if use_pos else None
+        self.tiers_len = tiers_len
 
         # Initialize with small variance
         nn.init.normal_(self.embedding.weight, std=0.02)
@@ -163,15 +165,18 @@ class SimpleTextEncoder(nn.Module):
             for prompt in inputs:
                 tags = [t.strip() for t in prompt.split(",") if t.strip()]
                 ids = [self.vocab.get(tag, self.unk_id) for tag in tags]
+                # drop unk tags
+                ids = [tag_id for tag_id in ids if tag_id != self.unk_id]
                 ids = ids[: self.max_seq_len]
                 batch_ids.append(ids)
 
             local_max_len = max((len(ids) for ids in batch_ids), default=1)
 
-            if local_max_len <= 24:
-                target_len = min(24, self.max_seq_len)
-            elif local_max_len <= 52:
-                target_len = min(52, self.max_seq_len)
+            # TODO: tiers in the config
+            if local_max_len <= self.tiers_len[0]:
+                target_len = min(self.tiers_len[0], self.max_seq_len)
+            elif local_max_len <= self.tiers_len[1]:
+                target_len = min(self.tiers_len[1], self.max_seq_len)
             else:
                 target_len = self.max_seq_len
 
@@ -200,10 +205,10 @@ class SimpleTextEncoder(nn.Module):
             else:
                 local_max_len = 1
 
-            if local_max_len <= 24:
-                target_len = min(24, self.max_seq_len)
-            elif local_max_len <= 52:
-                target_len = min(52, self.max_seq_len)
+            if local_max_len <= self.tiers_len[0]:
+                target_len = min(self.tiers_len[0], self.max_seq_len)
+            elif local_max_len <= self.tiers_len[1]:
+                target_len = min(self.tiers_len[1], self.max_seq_len)
             else:
                 target_len = self.max_seq_len
 

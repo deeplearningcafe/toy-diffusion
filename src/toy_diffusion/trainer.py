@@ -74,7 +74,8 @@ class Trainer:
         # Inject vocab properties into the config before building the model
         if self.conditional and hasattr(self.dataset, "vocab"):
             self.config["vocab"] = self.dataset.vocab
-            self.config["max_seq_len"] = self.dataset.max_seq_len
+            self.config["max_seq_len"] = self.dataset.tiers_len[-1]
+            self.config["tiers_len"] = self.dataset.tiers_len
             if self.config.get("cross_attention_dim") is None:
                 self.config["cross_attention_dim"] = 256
 
