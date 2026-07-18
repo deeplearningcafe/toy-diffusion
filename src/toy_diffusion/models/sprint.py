@@ -13,6 +13,84 @@ from toy_diffusion.models.dual_stream import (
 )
 
 
+def structured_token_drop(x, h_patches, w_patches, n=2, k=1):
+    """
+    Structured group-wise subsampling (Section 3.5 in the SPRINT paper).
+    Divides the token grid into non-overlapping n x n groups and randomly
+    selects k tokens from each group to guarantee local feature coverage.
+    """
+    B, N, D = x.shape
+    device = x.device
+
+    # naive random drop if dimensions are incompatible
+    if (h_patches % n != 0) or (w_patches % n != 0) or (h_patches * w_patches != N):
+        drop_ratio = 1.0 - (k / (n * n))
+        return random_token_drop(x, drop_ratio)
+
+    h_groups = h_patches // n
+    w_groups = w_patches // n
+    num_groups = h_groups * w_groups
+    group_size = n * n
+
+    # [B, num_groups, group_size] -> perturbation noise to extract indices
+    noise = torch.rand(B, num_groups, group_size, device=device)
+    ids_group_shuffle = torch.argsort(noise, dim=-1)
+    ids_group_keep = ids_group_shuffle[:, :, :k]
+
+    # Reconstruct global 2D grid coordinates back from the group relative ones
+    group_idx_h = (
+        torch.arange(h_groups, device=device)
+        .view(1, h_groups, 1, 1)
+        .expand(B, -1, w_groups, k)
+    )
+    group_idx_w = (
+        torch.arange(w_groups, device=device)
+        .view(1, 1, w_groups, 1)
+        .expand(B, h_groups, -1, k)
+    )
+
+    local_h = ids_group_keep // n
+    local_w = ids_group_keep % n
+
+    local_h = local_h.view(B, h_groups, w_groups, k)
+    local_w = local_w.view(B, h_groups, w_groups, k)
+
+    global_h = group_idx_h * n + local_h
+    global_w = group_idx_w * n + local_w
+
+    # Flatten to 1D index
+    global_indices = global_h * w_patches + global_w
+    ids_keep = global_indices.view(B, -1)
+
+    mask_keep = torch.zeros(B, N, dtype=torch.bool, device=device)
+    mask_keep.scatter_(
+        dim=1,
+        index=ids_keep,
+        src=torch.ones_like(ids_keep, dtype=torch.bool),
+    )
+
+    original_indices = torch.arange(N, device=device).unsqueeze(0).expand(B, -1)
+    priority = mask_keep.float() * N + original_indices.float() / (N + 1)
+    ids_shuffle = torch.argsort(priority, dim=1, descending=True)
+    ids_restore = torch.argsort(ids_shuffle, dim=1)
+
+    x_masked = torch.gather(x, dim=1, index=ids_keep.unsqueeze(-1).expand(-1, -1, D))
+
+    return x_masked, ids_keep, ids_restore
+
+
+def get_token_drop_indices(x, h_patches, w_patches, drop_ratio):
+    """
+    Unified entrypoint to choose structured dropping based on drop ratios.
+    """
+    if drop_ratio == 0.75:
+        return structured_token_drop(x, h_patches, w_patches, n=2, k=1)
+    elif drop_ratio == 0.50:
+        return structured_token_drop(x, h_patches, w_patches, n=2, k=2)
+    else:
+        return random_token_drop(x, drop_ratio)
+
+
 def random_token_drop(x, drop_ratio):
     """
     Randomly drops tokens from the sequence according to the specified ratio.
@@ -188,17 +266,13 @@ class SprintLuminaNextDit(LuminaNextDit):
 
         # Output projection
         self.norm_out = nn.RMSNorm(hidden_size, eps=eps)
-        self.proj_out = nn.Linear(
-            hidden_size, patch_size * patch_size * out_channels
-        )
+        self.proj_out = nn.Linear(hidden_size, patch_size * patch_size * out_channels)
 
         self.mask_token = nn.Parameter(torch.zeros(self.hidden_size))
         torch.nn.init.normal_(self.mask_token, std=0.02)
 
         if self.residual_type == "concat_linear":
-            self.renoise_linear = nn.Linear(
-                self.hidden_size * 2, self.hidden_size
-            )
+            self.renoise_linear = nn.Linear(self.hidden_size * 2, self.hidden_size)
             torch.nn.init.xavier_uniform_(self.renoise_linear.weight)
             nn.init.zeros_(self.renoise_linear.bias)
 
@@ -225,12 +299,8 @@ class SprintLuminaNextDit(LuminaNextDit):
             time_token = self.time_token_proj(t_emb).unsqueeze(1)
 
             if attention_mask is not None:
-                time_mask = torch.ones(
-                    (bsz, 1), dtype=torch.bool, device=x.device
-                )
-                full_text_mask = torch.cat(
-                    [time_mask, attention_mask.bool()], dim=1
-                )
+                time_mask = torch.ones((bsz, 1), dtype=torch.bool, device=x.device)
+                full_text_mask = torch.cat([time_mask, attention_mask.bool()], dim=1)
             else:
                 full_text_mask = torch.ones(
                     (bsz, encoder_hidden_states.shape[1] + 1),
@@ -238,9 +308,7 @@ class SprintLuminaNextDit(LuminaNextDit):
                     device=x.device,
                 )
 
-            all_pos_ids = self._build_position_ids(
-                full_text_mask, h_patches, w_patches
-            )
+            all_pos_ids = self._build_position_ids(full_text_mask, h_patches, w_patches)
             cos, sin = self.rope_embedder(all_pos_ids)
 
             cos_full = torch.cat([cos, cos], dim=-1)
@@ -282,9 +350,7 @@ class SprintLuminaNextDit(LuminaNextDit):
                         dtype=torch.bool,
                         device=x.device,
                     )
-                    full_mask = torch.cat(
-                        [attention_mask.bool(), img_mask], dim=1
-                    )
+                    full_mask = torch.cat([attention_mask.bool(), img_mask], dim=1)
                 else:
                     full_mask = None
             else:
@@ -326,8 +392,11 @@ class SprintLuminaNextDit(LuminaNextDit):
 
         # SPRINT token dropping
         if should_drop:
-            img_part_sparse, ids_keep, ids_restore = random_token_drop(
-                img_part, self.drop_ratio
+            img_part_sparse, ids_keep, ids_restore = get_token_drop_indices(
+                x,
+                h_patches=H // self.patch_size,
+                w_patches=W // self.patch_size,
+                drop_ratio=self.drop_ratio,
             )
             if img_mask is not None:
                 img_mask_sparse = torch.gather(img_mask, dim=1, index=ids_keep)
@@ -355,13 +424,9 @@ class SprintLuminaNextDit(LuminaNextDit):
             img_mask_sparse = img_mask
             img_rotary_emb_sparse = img_rotary_emb
 
-        hidden_states_sparse = torch.cat(
-            [text_part, img_part_sparse], dim=1
-        )
+        hidden_states_sparse = torch.cat([text_part, img_part_sparse], dim=1)
         if full_mask is not None:
-            full_mask_sparse = torch.cat(
-                [text_mask, img_mask_sparse], dim=1
-            )
+            full_mask_sparse = torch.cat([text_mask, img_mask_sparse], dim=1)
         else:
             full_mask_sparse = None
 
@@ -408,14 +473,10 @@ class SprintLuminaNextDit(LuminaNextDit):
 
         # SPRINT Residual Fusion (applied unconditionally for consistency)
         if self.residual_type == "concat_linear":
-            img_part_restored = torch.cat(
-                [img_part_restored, img_part_clone], dim=-1
-            )
+            img_part_restored = torch.cat([img_part_restored, img_part_clone], dim=-1)
             img_part_restored = self.renoise_linear(img_part_restored)
 
-        hidden_states = torch.cat(
-            [text_part_sparse, img_part_restored], dim=1
-        )
+        hidden_states = torch.cat([text_part_sparse, img_part_restored], dim=1)
 
         # Decoder stage (Dense)
         for block in self.decoder_blocks:
@@ -431,6 +492,7 @@ class SprintLuminaNextDit(LuminaNextDit):
         hidden_states = self.proj_out(hidden_states)
         x = self.unpatchify(hidden_states, H, W)
         return x
+
 
 class SprintDualStreamDiT(DualStreamDiT):
     """
@@ -570,12 +632,19 @@ class SprintDualStreamDiT(DualStreamDiT):
 
         self._zero_initialize_output()
 
-    def _drop_tokens(self, tokens, freqs):
-        (
-            tokens_sparse,
-            ids_keep,
-            ids_restore,
-        ) = random_token_drop(tokens, self.drop_ratio)
+    def _drop_tokens(self, tokens, freqs, h_patches=None, w_patches=None):
+        if h_patches is not None and w_patches is not None:
+            (
+                tokens_sparse,
+                ids_keep,
+                ids_restore,
+            ) = get_token_drop_indices(tokens, h_patches, w_patches, self.drop_ratio)
+        else:
+            (
+                tokens_sparse,
+                ids_keep,
+                ids_restore,
+            ) = random_token_drop(tokens, self.drop_ratio)
 
         cos, sin = freqs
         D_half = cos.shape[-1]
@@ -667,7 +736,7 @@ class SprintDualStreamDiT(DualStreamDiT):
                     image_freqs_sparse,
                     image_ids_keep,
                     image_ids_restore,
-                ) = self._drop_tokens(image_tokens, image_freqs)
+                ) = self._drop_tokens(image_tokens, image_freqs, h_patches, w_patches)
             else:
                 image_tokens_sparse = image_tokens
                 image_freqs_sparse = image_freqs
