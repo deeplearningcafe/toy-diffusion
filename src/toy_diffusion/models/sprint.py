@@ -142,7 +142,7 @@ class SprintLuminaNextDit(LuminaNextDit):
         self.norm_out = nn.RMSNorm(hidden_size, eps=eps)
         self.proj_out = nn.Linear(hidden_size, patch_size * patch_size * in_channels)
 
-        self.mask_token = nn.Parameter(torch.zeros(1, 1, self.hidden_size))
+        self.mask_token = nn.Parameter(torch.zeros(self.hidden_size))
         torch.nn.init.normal_(self.mask_token, std=0.02)
 
         if self.residual_type == "concat_linear":
@@ -171,6 +171,7 @@ class SprintLuminaNextDit(LuminaNextDit):
                 image_rotary_emb=image_rotary_emb,
             )
 
+        mask_token_3d = self.mask_token.view(1, 1, -1)
         x_clone = x.clone()
         should_drop = self.training and (self.drop_ratio > 0.0)
 
@@ -209,7 +210,7 @@ class SprintLuminaNextDit(LuminaNextDit):
 
         # Sequence restoration
         if should_drop:
-            x = restore_full_sequence(x_sparse, ids_restore, self.mask_token)
+            x = restore_full_sequence(x_sparse, ids_restore, mask_token_3d)
         else:
             x = x_sparse
 
@@ -217,7 +218,7 @@ class SprintLuminaNextDit(LuminaNextDit):
         if self.training and self.cfg_mask_prob > 0:
             B_sz = x.shape[0]
             sample_mask = torch.rand(B_sz, device=x.device) < self.cfg_mask_prob
-            mask_tokens_expanded = self.mask_token.expand(B_sz, x.shape[1], x.shape[2])
+            mask_tokens_expanded = mask_token_3d.expand(B_sz, x.shape[1], x.shape[2])
             x = torch.where(
                 sample_mask.unsqueeze(1).unsqueeze(2), mask_tokens_expanded, x
             )
@@ -356,8 +357,9 @@ class SprintDualStreamDiT(DualStreamDiT):
         self.norm_final = nn.RMSNorm(hidden_size, eps=eps)
         self.proj_out = nn.Linear(hidden_size, patch_size * patch_size * out_channels)
 
-        self.mask_token_image = nn.Parameter(torch.zeros(1, 1, self.hidden_size))
-        self.mask_token_text = nn.Parameter(torch.zeros(1, 1, self.hidden_size))
+        # torch compile squeezes during bw so remove dims
+        self.mask_token_image = nn.Parameter(torch.zeros(self.hidden_size))
+        self.mask_token_text = nn.Parameter(torch.zeros(self.hidden_size))
         torch.nn.init.normal_(self.mask_token_image, std=0.02)
         torch.nn.init.normal_(self.mask_token_text, std=0.02)
 
@@ -440,6 +442,9 @@ class SprintDualStreamDiT(DualStreamDiT):
             )
             skips.append((image_tokens, text_tokens))
 
+        mask_token_image_3d = self.mask_token_image.view(1, 1, -1)
+        mask_token_text_3d = self.mask_token_text.view(1, 1, -1)
+
         image_tokens_clone = image_tokens.clone()
         text_tokens_clone = text_tokens.clone()
         should_drop = self.training and (self.drop_ratio > 0.0)
@@ -492,7 +497,7 @@ class SprintDualStreamDiT(DualStreamDiT):
                 image_tokens = restore_full_sequence(
                     image_tokens_sparse,
                     image_ids_restore,
-                    self.mask_token_image,
+                    mask_token_image_3d,
                 )
             else:
                 image_tokens = image_tokens_sparse
@@ -501,7 +506,7 @@ class SprintDualStreamDiT(DualStreamDiT):
                 text_tokens = restore_full_sequence(
                     text_tokens_sparse,
                     text_ids_restore,
-                    self.mask_token_text,
+                    mask_token_text_3d,
                 )
             else:
                 text_tokens = text_tokens_sparse
@@ -516,7 +521,7 @@ class SprintDualStreamDiT(DualStreamDiT):
                 torch.rand(bsz, device=image_tokens.device) < self.cfg_mask_prob
             )
             if self.drop_target in ["image", "both"]:
-                mask_tokens_expanded = self.mask_token_image.expand(
+                mask_tokens_expanded = mask_token_image_3d.expand(
                     bsz, image_tokens.shape[1], self.hidden_size
                 )
                 image_tokens = torch.where(
@@ -525,7 +530,7 @@ class SprintDualStreamDiT(DualStreamDiT):
                     image_tokens,
                 )
             if self.drop_target in ["text", "both"]:
-                mask_tokens_expanded = self.mask_token_text.expand(
+                mask_tokens_expanded = mask_token_text_3d.expand(
                     bsz, text_tokens.shape[1], self.hidden_size
                 )
                 text_tokens = torch.where(
