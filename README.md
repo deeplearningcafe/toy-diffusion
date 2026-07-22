@@ -34,6 +34,11 @@ A Gradio-based dashboard to "feel" the vector fields:
 *   **Schedule Comparison**: Real-time switching between Linear (FM) and
     DDPM paths.
 
+### 4. Inference
+The pretrained models can be used for inference in 2 ways.
+*   **Gradio UI**: dashboard to generate images using custom prompts.
+*   **CLI**: script to generate samples using the terminal.
+
 ## 📦 Installation
 
 ```bash

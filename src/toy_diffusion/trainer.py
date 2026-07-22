@@ -284,7 +284,7 @@ class Trainer:
             f"Starting training: {self.config['schedule_type']} | Pred: {self.prediction_target}"
         )
 
-        output_dir = self.config.get("output_dir", "results/checkpoints")
+        output_dir = self.config.get("output_dir", f"results/checkpoints/{timestamp}")
 
         for epoch in range(self.start_epoch, epochs):
             if (
