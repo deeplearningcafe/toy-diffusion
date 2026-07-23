@@ -96,7 +96,7 @@ class ImageDataset(Dataset):
         self.cfg_dropout_prob = cfg_dropout_prob
         self.tag_dropout_prob = tag_dropout_prob
         self.use_short_prompts = use_short_prompts
-        self.tiers_len = None
+        self.tiers_len = tiers_len
 
         print(
             f"Using shuffling {self.shuffle_tags}, cfg prob: {self.cfg_dropout_prob} and tag prob: {self.tag_dropout_prob}"
@@ -161,6 +161,29 @@ class ImageDataset(Dataset):
             p for p in self.root_dir.rglob("*") if p.suffix.lower() in IMAGE_SUFFIXES
         ]
 
+    def _get_prompt(self, p: Path) -> str:
+        """Helper to read text prompt for a given file path."""
+        short_txt = p.with_name(f"{p.stem}_short.txt")
+        standard_txt = p.with_suffix(".txt")
+        txt_path = (
+            short_txt
+            if (self.use_short_prompts and short_txt.exists())
+            else standard_txt
+        )
+        if txt_path.exists():
+            with open(txt_path, "r", encoding="utf-8") as f:
+                return f.read().strip()
+        return ""
+
+    def _load_latent_tensor(self, p: Path):
+        """Helper to load unscaled latent tensor from .npz file."""
+        npz_path = p.with_suffix(".npz")
+        if npz_path.exists():
+            with np.load(npz_path) as data:
+                key = "latent" if "latent" in data else data.files[0]
+                return torch.from_numpy(data[key]).float()
+        return None
+
     def _filter_paths(self, all_paths):
         """
         Filters the dataset paths based on the exclude_tags list.
@@ -175,24 +198,13 @@ class ImageDataset(Dataset):
         normal_paths = []
 
         for p in all_paths:
-            short_txt = p.with_name(f"{p.stem}_short.txt")
-            standard_txt = p.with_suffix(".txt")
-            txt_path = (
-                short_txt
-                if (self.use_short_prompts and short_txt.exists())
-                else standard_txt
-            )
-
-            if txt_path.exists():
-                with open(txt_path, "r", encoding="utf-8") as f:
-                    prompt = f.read().strip().lower()
-                    tags = set([t.strip() for t in prompt.split(",")])
-
-                    # isdisjoint is True if no common elements exist
-                    if not exclude_set.isdisjoint(tags):
-                        excluded_paths.append(p)
-                    else:
-                        normal_paths.append(p)
+            prompt = self._get_prompt(p).lower()
+            if prompt:
+                tags = set([t.strip() for t in prompt.split(",") if t.strip()])
+                if not exclude_set.isdisjoint(tags):
+                    excluded_paths.append(p)
+                else:
+                    normal_paths.append(p)
             else:
                 normal_paths.append(p)
 
@@ -232,8 +244,13 @@ class ImageDataset(Dataset):
         # ignore, max is always biggest tier
         self.max_seq_len = 0
         prompt_lengths = []
-        for item in self.tensors_list:
-            prompt = item[1]
+
+        if self.load_into_ram:
+            prompts = [item[1] for item in self.tensors_list]
+        else:
+            prompts = [self._get_prompt(p) for p in self.img_paths]
+
+        for prompt in prompts:
             tags = [t.strip() for t in prompt.split(",") if t.strip()]
             prompt_lengths.append(len(tags))
             self.max_seq_len = max(self.max_seq_len, len(tags))
@@ -253,7 +270,6 @@ class ImageDataset(Dataset):
         print(f"Prompt Length Stats - Mean: {mean_len:.2f}, Median: {median_len:.2f}")
         print(f"Quantiles (25%, 50%, 75%, 90%, 95%, 99%): {quantiles}")
 
-        # TODO: create tiers dynamically using 99 QT
         if self.tiers_len:
             tier_1_boundary = self.tiers_len[0]
             tier_2_boundary = self.tiers_len[1]
@@ -285,26 +301,12 @@ class ImageDataset(Dataset):
         Returns:
             Tuple containing the data (and prompt if conditional) and path
         """
-        prompt = ""
-        if self.conditional:
-            short_txt = p.with_name(f"{p.stem}_short.txt")
-            standard_txt = p.with_suffix(".txt")
-            txt_path = (
-                short_txt
-                if (self.use_short_prompts and short_txt.exists())
-                else standard_txt
-            )
-            if txt_path.exists():
-                with open(txt_path, "r", encoding="utf-8") as f:
-                    prompt = f.read().strip()
+        prompt = self._get_prompt(p) if self.conditional else ""
 
         if self.is_latents:
-            npz_path = p.with_suffix(".npz")
-            if npz_path.exists():
-                with np.load(npz_path) as data:
-                    key = "latent" if "latent" in data else data.files[0]
-                    latent = torch.from_numpy(data[key])
-                    latent = self.vae_scale * (latent - self.vae_shift)
+            latent = self._load_latent_tensor(p)
+            if latent is not None:
+                latent = self.vae_scale * (latent - self.vae_shift)
                 if self.conditional:
                     return (latent, prompt), p
                 return latent, p
@@ -381,24 +383,66 @@ class ImageDataset(Dataset):
 
         return tensors_list, paths_list
 
-    def _compute_latents_factors(self):
+    def _compute_latents_factors(self, chunk_size: int = 5000):
         """
-        Empirically calculates the mean and std of the loaded latents
-        to set vae_shift and vae_scale, and normalizes the dataset in RAM.
+        Empirically calculates mean and std of latents using batched
+        vectorized PyTorch operations and multi-threaded loading.
         """
         print("Calculating empirical statistics for latents...")
-        if len(self.tensors_list) == 0:
+        total_items = (
+            len(self.tensors_list) if self.load_into_ram else len(self.img_paths)
+        )
+        if total_items == 0:
             return
 
-        num_samples = min(50000, len(self.tensors_list))
-        if self.conditional:
-            subset = [self.tensors_list[i][0] for i in range(num_samples)]
-        else:
-            subset = [self.tensors_list[i] for i in range(num_samples)]
+        num_samples = min(80000, total_items)
 
-        subset_tensor = torch.stack(subset)
-        empirical_mean = subset_tensor.mean().item()
-        empirical_std = subset_tensor.std().item()
+        count = 0
+        mean = 0.0
+        m2 = 0.0
+
+        for i in range(0, num_samples, chunk_size):
+            end_idx = min(i + chunk_size, num_samples)
+
+            if self.load_into_ram:
+                chunk_latents = [
+                    self.tensors_list[j][0]
+                    if self.conditional
+                    else self.tensors_list[j]
+                    for j in range(i, end_idx)
+                ]
+            else:
+                chunk_paths = self.img_paths[i:end_idx]
+                with ThreadPoolExecutor(max_workers=self.num_workers) as executor:
+                    results = list(executor.map(self._load_latent_tensor, chunk_paths))
+                chunk_latents = [lat for lat in results if lat is not None]
+
+            if not chunk_latents:
+                continue
+
+            chunk_tensor = torch.stack(chunk_latents).to(torch.float64)
+            n_b = chunk_tensor.numel()
+            mean_b = chunk_tensor.mean().item()
+            m2_b = ((chunk_tensor - mean_b) ** 2).sum().item()
+
+            if count == 0:
+                count = n_b
+                mean = mean_b
+                m2 = m2_b
+            else:
+                # Chan's parallel combination update
+                delta = mean_b - mean
+                count_next = count + n_b
+                mean = mean + delta * (n_b / count_next)
+                m2 = m2 + m2_b + (delta**2) * (count * n_b / count_next)
+                count = count_next
+
+        if count > 1:
+            empirical_mean = mean
+            empirical_std = (m2 / (count - 1)) ** 0.5
+        else:
+            empirical_mean = 0.0
+            empirical_std = 1.0
 
         self.vae_shift = empirical_mean
         self.vae_scale = 1.0 / empirical_std if empirical_std > 0 else 1.0
@@ -406,16 +450,17 @@ class ImageDataset(Dataset):
         print(f"Calculated Empirical Shift (Mean): {self.vae_shift:.4f}")
         print(f"Calculated Empirical Scale (1/Std): {self.vae_scale:.4f}")
 
-        print("Applying empirical normalization to loaded latents...")
-        for i in range(len(self.tensors_list)):
-            if self.conditional:
-                latent, prompt = self.tensors_list[i]
-                norm_lat = self.vae_scale * (latent - self.vae_shift)
-                self.tensors_list[i] = (norm_lat, prompt)
-            else:
-                latent = self.tensors_list[i]
-                norm_lat = self.vae_scale * (latent - self.vae_shift)
-                self.tensors_list[i] = norm_lat
+        if self.load_into_ram:
+            print("Applying empirical normalization to loaded latents...")
+            for idx in range(len(self.tensors_list)):
+                if self.conditional:
+                    latent, prompt = self.tensors_list[idx]
+                    norm_lat = self.vae_scale * (latent - self.vae_shift)
+                    self.tensors_list[idx] = (norm_lat, prompt)
+                else:
+                    latent = self.tensors_list[idx]
+                    norm_lat = self.vae_scale * (latent - self.vae_shift)
+                    self.tensors_list[idx] = norm_lat
 
     def _create_attention_mask(self, prompt):
         if self.cfg_dropout_prob > 0.0 and random.random() < self.cfg_dropout_prob:
