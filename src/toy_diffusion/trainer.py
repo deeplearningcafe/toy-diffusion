@@ -23,6 +23,13 @@ from toy_diffusion.utils.visualization import (
     visualize_image_trajectory,
 )
 
+from toy_diffusion.utils.checkpointing import (
+    save_checkpoint,
+    load_from_checkpoint,
+    load_checkpoint_config,
+    load_checkpoint_vocab,
+)
+
 try:
     from toy_diffusion.utils.act_grad_checkpointing import (
         patch_unsloth_smart_gradient_checkpointing,
@@ -122,13 +129,16 @@ class Trainer:
         self.start_epoch = 0
         resume_dir = config.get("resume_from_checkpoint", None)
         if resume_dir is not None:
-            self.start_epoch = load_from_checkpoint(
+            self.start_epoch, ckpt_cfg, ckpt_vocab = load_from_checkpoint(
                 checkpoint_dir=resume_dir,
                 model=self.model,
                 optimizer=self.optimizer,
                 scheduler=self.scheduler,
                 ema=self.ema,
             )
+            if ckpt_vocab and "vocab" not in self.config:
+                self.config["vocab"] = ckpt_vocab
+
             if self.use_ema_config and self.start_epoch >= self.ema_start_epoch:
                 if self.ema.ema_model is None:
                     self.ema.initialize(self.model)
@@ -311,6 +321,10 @@ class Trainer:
                 self.run_sampling(timestamp, epoch, num_steps)
 
             if save_interval > 0 and (epoch + 1) % save_interval == 0:
+                vocab = getattr(self.dataset, "vocab", None)
+                if vocab is None:
+                    vocab = self.config.get("vocab", None)
+
                 save_checkpoint(
                     output_dir=output_dir,
                     epoch=epoch + 1,
@@ -318,6 +332,8 @@ class Trainer:
                     optimizer=self.optimizer,
                     scheduler=self.scheduler,
                     ema=self.ema,
+                    config=self.config,
+                    vocab=vocab,
                 )
 
         return self.model

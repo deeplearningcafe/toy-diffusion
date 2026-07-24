@@ -1,11 +1,10 @@
+import json
+from pathlib import Path
 import torch
 import torch.nn as nn
 import logging
 import omegaconf
-import copy
-import contextlib
 import os
-from safetensors.torch import save_file, load_file
 
 try:
     from diffusers import AutoencoderKL
@@ -24,8 +23,8 @@ from toy_diffusion.models.mlp import (
 from toy_diffusion.models.unet import Unet
 from toy_diffusion.models.efficient_unet import EfficientUnet
 from toy_diffusion.models.dual_stream import DualStreamDiT
+from toy_diffusion.models.dual_stream import LuminaNextDit
 from toy_diffusion.models.aux_models import (
-    EMAModel,
     SimpleTextEncoder,
     init_weights,
     HFTextEncoder,
@@ -42,6 +41,8 @@ from toy_diffusion.losses import (
 )
 from toy_diffusion.paths.scheduler import LinearSchedule, DDPMSchedule, VESchedule
 
+from toy_diffusion.utils.checkpointing import load_checkpoint_vocab
+
 
 def get_model(config, device):
     text_enc = None
@@ -57,14 +58,23 @@ def get_model(config, device):
             cross_attention_dim = text_enc.embed_dim
         else:
             vocab = config.get("vocab", {"<pad>": 0, "<unk>": 1})
+            if isinstance(vocab, (str, Path)) and os.path.exists(vocab):
+                with open(vocab, "r", encoding="utf-8") as f:
+                    vocab = json.load(f)
+            elif not isinstance(vocab, dict) and config.get("resume_from_checkpoint"):
+                ckpt_vocab = load_checkpoint_vocab(config["resume_from_checkpoint"])
+                if ckpt_vocab:
+                    vocab = ckpt_vocab
+
             max_seq_len = config.get("max_seq_len", 16)
             if cross_attention_dim is None:
                 cross_attention_dim = 256
+            tiers_len = config.get("tiers_len", [24, 38])
             text_enc = SimpleTextEncoder(
                 vocab=vocab,
                 max_seq_len=max_seq_len,
                 embed_dim=cross_attention_dim,
-                tiers_len=config["tiers_len"],
+                tiers_len=tiers_len,
                 use_pos=config.get("use_pos", False),
             ).to(device)
 
@@ -132,6 +142,28 @@ def get_model(config, device):
             text_embed_dim=cross_attention_dim,
             depth=config["depth"],
             use_checkpointing=config.get("use_gradient_checkpointing", False),
+            use_rope_text_adapter=config.get("use_rope_text_adapter", False),
+        ).to(device)
+
+        model = (
+            nn.ModuleDict({"unet": unet, "text_enc": text_enc})
+            if text_enc is not None
+            else unet
+        )
+    elif config["model_type"] == "single_stream":
+        in_channels = config.get("in_channels", 3)
+        unet = LuminaNextDit(
+            in_channels=in_channels,
+            out_channels=in_channels,
+            hidden_size=config["hidden_dim"],
+            num_attention_heads=config.get("num_heads", 12),
+            num_kv_heads=config.get("num_kv_heads", 4),
+            use_i1=config.get("use_i1", False),
+            use_skip=config.get("use_i1", False),
+            text_embed_dim=cross_attention_dim,
+            depth=config["depth"],
+            use_checkpointing=config.get("use_gradient_checkpointing", False),
+            use_rope_text_adapter=config.get("use_rope_text_adapter", False),
         ).to(device)
 
         model = (
@@ -356,84 +388,6 @@ def create_optim_scheduler(model, len_train_loader: int, conf: omegaconf.DictCon
         )
 
     return optimizer, scheduler
-
-
-def save_checkpoint(
-    output_dir: str,
-    epoch: int,
-    model: nn.Module,
-    optimizer: torch.optim.Optimizer,
-    scheduler=None,
-    ema: EMAModel = None,
-):
-    """Saves model, optimizer, scheduler, and EMA states safely."""
-    save_dir = os.path.join(output_dir, f"epoch_{epoch}")
-    os.makedirs(save_dir, exist_ok=True)
-
-    state_dict = model.state_dict()
-    clean_state_dict = {k.replace("_orig_mod.", ""): v for k, v in state_dict.items()}
-
-    model_path = os.path.join(save_dir, "model.safetensors")
-    save_file(clean_state_dict, model_path)
-
-    if ema is not None and ema.use_ema and ema.ema_model is not None:
-        ema_state_dict = ema.ema_model.state_dict()
-        clean_ema_state_dict = {
-            k.replace("_orig_mod.", ""): v for k, v in ema_state_dict.items()
-        }
-        ema_path = os.path.join(save_dir, "ema_model.safetensors")
-        save_file(clean_ema_state_dict, ema_path)
-
-    torch.save(optimizer.state_dict(), os.path.join(save_dir, "optimizer.pt"))
-
-    if scheduler is not None:
-        torch.save(scheduler.state_dict(), os.path.join(save_dir, "scheduler.pt"))
-    logging.info(f"Checkpoint saved successfully at {save_dir}")
-
-
-def load_from_checkpoint(
-    checkpoint_dir: str,
-    model: nn.Module,
-    optimizer: torch.optim.Optimizer,
-    scheduler=None,
-    ema: EMAModel = None,
-) -> int:
-    """Loads states from a checkpoint directory and returns the start epoch."""
-    logging.info(f"Loading checkpoint from {checkpoint_dir}")
-
-    model_path = os.path.join(checkpoint_dir, "model.safetensors")
-    if os.path.exists(model_path):
-        state_dict = load_file(model_path)
-        sanitized_state_dict = {
-            k.replace("_orig_mod.", ""): v for k, v in state_dict.items()
-        }
-        model.load_state_dict(sanitized_state_dict)
-
-    ema_path = os.path.join(checkpoint_dir, "ema_model.safetensors")
-    if ema is not None and ema.use_ema and os.path.exists(ema_path):
-        if ema.ema_model is None:
-            ema.initialize(model)
-        ema.ema_model.load_state_dict(load_file(ema_path))
-
-    opt_path = os.path.join(checkpoint_dir, "optimizer.pt")
-    if os.path.exists(opt_path):
-        optimizer.load_state_dict(torch.load(opt_path, map_location="cpu"))
-
-    sched_path = os.path.join(checkpoint_dir, "scheduler.pt")
-    if scheduler is not None and os.path.exists(sched_path):
-        scheduler.load_state_dict(torch.load(sched_path, map_location="cpu"))
-
-    # Extract epoch from directory name (e.g., "epoch_10")
-    start_epoch = 0
-    base_name = os.path.basename(os.path.normpath(checkpoint_dir))
-    if base_name.startswith("epoch_"):
-        try:
-            start_epoch = int(base_name.split("_")[1])
-        except ValueError:
-            pass
-
-    logging.info(f"Resuming training from epoch {start_epoch}")
-    return start_epoch
 
 
 def gpu_setup(device: str = "cuda"):

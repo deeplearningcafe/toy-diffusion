@@ -242,7 +242,7 @@ class LuminaNextDit(nn.Module):
                         num_attention_heads=num_attention_heads,
                         num_kv_heads=num_kv_heads,
                         eps=eps,
-                        base_sequence_length=base_sequence_length,
+                        base_sequence_length=None,
                         use_i1=True,
                         use_checkpointing=use_checkpointing,
                     )
@@ -265,7 +265,7 @@ class LuminaNextDit(nn.Module):
                         num_attention_heads=num_attention_heads,
                         num_kv_heads=num_kv_heads,
                         eps=eps,
-                        base_sequence_length=base_sequence_length,
+                        base_sequence_length=None,
                         use_i1=use_i1,
                         use_checkpointing=use_checkpointing,
                     )
@@ -277,7 +277,7 @@ class LuminaNextDit(nn.Module):
                 num_attention_heads=num_attention_heads,
                 num_kv_heads=num_kv_heads,
                 eps=eps,
-                base_sequence_length=base_sequence_length,
+                base_sequence_length=None,
                 use_i1=use_i1,
                 use_checkpointing=use_checkpointing,
             )
@@ -288,7 +288,7 @@ class LuminaNextDit(nn.Module):
                         num_attention_heads=num_attention_heads,
                         num_kv_heads=num_kv_heads,
                         eps=eps,
-                        base_sequence_length=base_sequence_length,
+                        base_sequence_length=None,
                         use_i1=use_i1,
                         use_skip=True,
                         use_checkpointing=use_checkpointing,

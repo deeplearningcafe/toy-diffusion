@@ -1,5 +1,7 @@
 import torch
 import torch.nn as nn
+from pathlib import Path
+import json
 import copy
 import contextlib
 from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -136,13 +138,16 @@ class SimpleTextEncoder(nn.Module):
 
     def __init__(
         self,
-        vocab: dict,
+        vocab: dict | str | Path,
         max_seq_len: int,
         embed_dim: int,
         tiers_len: list = [24, 52],
         use_pos: bool = False,
     ):
         super().__init__()
+        if isinstance(vocab, (str, Path)):
+            with open(vocab, "r", encoding="utf-8") as f:
+                vocab = json.load(f)
         self.vocab = vocab
         self.max_seq_len = max_seq_len
         self.pad_id = vocab.get("<pad>", 0)

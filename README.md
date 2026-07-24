@@ -118,6 +118,7 @@ The core logic resides in `src/toy_diffusion/losses.py` and
 ## References
 *   **Danbooru2024 Dataset**: [p1atdev/danbooru-2024](https://huggingface.co/datasets/p1atdev/danbooru-2024)
 *   **SnapGen**: [paper](https://arxiv.org/abs/2412.09619). The `EfficientUnet` model implementation is based on this paper.
+*   **i1**: [paper](https://arxiv.org/abs/2606.11289). The `DualStream` and part of the `Lumina` model implementation is based on this paper.
 
 ## Author
 [aipracticecafe](https://github.com/deeplearningcafe)

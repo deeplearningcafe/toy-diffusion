@@ -13,6 +13,11 @@ from toy_diffusion.ui.inference_app import (
     create_inference_ui,
     generate_images_custom,
 )
+from toy_diffusion.utils.checkpointing import (
+    load_checkpoint_config,
+    load_checkpoint_vocab,
+)
+
 
 def main():
     parser = argparse.ArgumentParser(
@@ -34,7 +39,7 @@ def main():
         "--prompt",
         type=str,
         default="1girl, solo, asuka langley, neon genesis evangelion, "
-                "red hair, blue eyes",
+        "red hair, blue eyes",
         help="Prompt for conditional generation",
     )
     parser.add_argument(
@@ -92,9 +97,6 @@ def main():
     cfg = OmegaConf.merge(base_conf, cli_conf)
     timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
 
-    if args.checkpoint_dir is not None:
-        cfg.training.resume_from_checkpoint = args.checkpoint_dir
-
     device = cfg.training.device
     if device == "cuda" and not torch.cuda.is_available():
         device = "cpu"
@@ -108,6 +110,17 @@ def main():
         **OmegaConf.to_container(cfg.sampling),
         "device": device,
     }
+
+    if args.checkpoint_dir is not None:
+        cfg.training.resume_from_checkpoint = args.checkpoint_dir
+        ckpt_cfg = load_checkpoint_config(args.checkpoint_dir)
+        ckpt_vocab = load_checkpoint_vocab(args.checkpoint_dir)
+        if ckpt_cfg:
+            for k, v in ckpt_cfg.items():
+                if k not in ["device"]:
+                    config[k] = v
+        if ckpt_vocab:
+            config["vocab"] = ckpt_vocab
 
     # Setup seed
     seed = config.get("seed", 42)
@@ -186,16 +199,18 @@ def main():
             batch_size=args.batch_size,
             seed=seed,
         )
-        
+
         # Save outputs
         grid_img = images[0]
         grid_img.save(f"{output_dir}/grid_output.png")
         print(f"Saved grid output to {output_dir}/grid_output.png")
-        
+
         for idx, img in enumerate(images[1:]):
             img_path = f"{output_dir}/sample_{idx}.png"
             img.save(img_path)
             print(f"Saved sample {idx} to {img_path}")
 
+
 if __name__ == "__main__":
     main()
+
