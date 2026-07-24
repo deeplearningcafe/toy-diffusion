@@ -1,6 +1,7 @@
 import enum
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import math
 
 HAS_FLASH_ATTENTION = False
@@ -684,10 +685,20 @@ class TransformerTextAdapter(nn.Module):
             ]
         )
 
-    def forward(self, x, attention_mask=None):
+    def forward(
+        self,
+        x: torch.Tensor,
+        attention_mask: torch.Tensor = None,
+        text_rotary_emb: torch.Tensor = None,
+    ) -> torch.Tensor:
         x = self.proj_in(x)
         for block in self.blocks:
-            x = block(x, encoder_hidden_states=None, attention_mask=attention_mask)
+            x = block(
+                x,
+                encoder_hidden_states=None,
+                attention_mask=attention_mask,
+                image_rotary_emb=text_rotary_emb,
+            )
         return x
 
 
@@ -784,3 +795,67 @@ class Transformer2DBlock(nn.Module):
         x = x + res
 
         return x
+
+
+# based on https://github.com/zlab-princeton/i1/blob/main/torch_inference/generate.py
+def _default_rope_axes_dims(head_dim: int) -> tuple[int, int, int]:
+    """Splits the head dimension into 3 chunks for Text, Y, and X coordinates."""
+    if head_dim % 2 != 0:
+        raise ValueError("Head dimension must be even for RoPE.")
+    time_dim = head_dim // 2
+    if time_dim % 2 != 0:
+        time_dim -= 1
+    remaining = head_dim - time_dim
+    row_dim = remaining // 2
+    col_dim = remaining - row_dim
+    if row_dim % 2 != 0:
+        row_dim -= 1
+        col_dim += 1
+    if col_dim % 2 != 0:
+        col_dim -= 1
+        row_dim += 1
+    if min(time_dim, row_dim, col_dim) <= 0:
+        raise ValueError("Each RoPE axis must receive at least two dimensions.")
+    return time_dim, row_dim, col_dim
+
+
+class MultimodalRopeEmbedder(nn.Module):
+    """3D RoPE for Joint Text and Image streams."""
+
+    def __init__(
+        self,
+        axes_dims: tuple[int, int, int],
+        max_text_len: int = 512,
+        max_spatial_dim: int = 128,
+        theta: float = 10000.0,
+    ) -> None:
+        super().__init__()
+        axes_lens = (max_text_len, max_spatial_dim, max_spatial_dim)
+
+        cos_tables = []
+        sin_tables = []
+        for dim, axis_len in zip(axes_dims, axes_lens):
+            steps = torch.arange(0, dim, 2, dtype=torch.float32)
+            base = 1.0 / (theta ** (steps / dim))
+            positions = torch.arange(axis_len, dtype=torch.float32)
+            angles = positions[:, None] * base[None, :]
+            cos_tables.append(angles.cos())
+            sin_tables.append(angles.sin())
+
+        self.cos_tables = nn.ParameterList(
+            [nn.Parameter(t, requires_grad=False) for t in cos_tables]
+        )
+        self.sin_tables = nn.ParameterList(
+            [nn.Parameter(t, requires_grad=False) for t in sin_tables]
+        )
+
+    def forward(self, position_ids: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        cos = []
+        sin = []
+        for axis_idx, (cos_table, sin_table) in enumerate(
+            zip(self.cos_tables, self.sin_tables)
+        ):
+            pos = position_ids[:, :, axis_idx].clamp(0, cos_table.shape[0] - 1)
+            cos.append(F.embedding(pos, cos_table))
+            sin.append(F.embedding(pos, sin_table))
+        return torch.cat(cos, dim=-1), torch.cat(sin, dim=-1)
