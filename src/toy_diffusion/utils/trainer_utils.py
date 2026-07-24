@@ -23,7 +23,7 @@ from toy_diffusion.models.mlp import (
 from toy_diffusion.models.unet import Unet
 from toy_diffusion.models.efficient_unet import EfficientUnet
 from toy_diffusion.models.dual_stream import DualStreamDiT
-from toy_diffusion.models.dual_stream import LuminaNextDit
+from toy_diffusion.models.dit import LuminaNextDit
 from toy_diffusion.models.aux_models import (
     SimpleTextEncoder,
     init_weights,
@@ -158,9 +158,9 @@ def get_model(config, device):
             hidden_size=config["hidden_dim"],
             num_attention_heads=config.get("num_heads", 12),
             num_kv_heads=config.get("num_kv_heads", 4),
-            use_i1=config.get("use_i1", False),
-            use_skip=config.get("use_i1", False),
-            text_embed_dim=cross_attention_dim,
+            use_i1=config.get("use_i1", True),
+            use_skip=config.get("use_i1", True),
+            cross_attention_dim=cross_attention_dim,
             depth=config["depth"],
             use_checkpointing=config.get("use_gradient_checkpointing", False),
             use_rope_text_adapter=config.get("use_rope_text_adapter", False),

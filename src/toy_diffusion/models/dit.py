@@ -402,7 +402,11 @@ class LuminaNextDit(nn.Module):
 
             all_pos_ids = self._build_position_ids(full_text_mask, h_patches, w_patches)
             cos, sin = self.rope_embedder(all_pos_ids)
-            rotary_emb = torch.cat([cos, sin], dim=-1)
+
+            # Expand cos and sin to full HeadDim for apply_rotary_emb
+            cos_full = torch.cat([cos, cos], dim=-1)
+            sin_full = torch.cat([sin, sin], dim=-1)
+            rotary_emb = torch.cat([cos_full, sin_full], dim=-1)
 
             # Extract Text and Image RoPE slices
             text_len = encoder_hidden_states.shape[1]
@@ -471,8 +475,21 @@ class LuminaNextDit(nn.Module):
             if encoder_hidden_states is not None:
                 text_tokens = self.cap_embedder(encoder_hidden_states)
                 hidden_states = torch.cat([text_tokens, img_tokens], dim=1)
+
+                if attention_mask is not None:
+                    img_mask = torch.ones(
+                        (bsz, img_tokens.shape[1]),
+                        dtype=torch.bool,
+                        device=x.device,
+                    )
+                    full_mask = torch.cat(
+                        [attention_mask.bool(), img_mask], dim=1
+                    )
+                else:
+                    full_mask = None
             else:
                 hidden_states = img_tokens
+                full_mask = None
 
             if self.use_skip:
                 skips = []
@@ -480,7 +497,7 @@ class LuminaNextDit(nn.Module):
                     hidden_states = block(
                         hidden_states=hidden_states,
                         temb=t_emb,
-                        attention_mask=attention_mask,
+                        attention_mask=full_mask,
                         image_rotary_emb=image_rotary_emb,
                     )
                     skips.append(hidden_states)
@@ -488,7 +505,7 @@ class LuminaNextDit(nn.Module):
                 hidden_states = self.mid_block(
                     hidden_states=hidden_states,
                     temb=t_emb,
-                    attention_mask=attention_mask,
+                    attention_mask=full_mask,
                     image_rotary_emb=image_rotary_emb,
                 )
 
@@ -497,7 +514,7 @@ class LuminaNextDit(nn.Module):
                     hidden_states = block(
                         hidden_states=hidden_states,
                         temb=t_emb,
-                        attention_mask=attention_mask,
+                        attention_mask=full_mask,
                         image_rotary_emb=image_rotary_emb,
                         skip=skip_tensor,
                     )
@@ -506,7 +523,7 @@ class LuminaNextDit(nn.Module):
                     hidden_states = block(
                         hidden_states=hidden_states,
                         temb=t_emb,
-                        attention_mask=attention_mask,
+                        attention_mask=full_mask,
                         image_rotary_emb=image_rotary_emb,
                     )
 

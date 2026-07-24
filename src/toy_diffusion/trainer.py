@@ -11,12 +11,10 @@ from toy_diffusion.utils.trainer_utils import (
     get_model,
     get_schedule_loss,
     create_optim_scheduler,
-    EMAModel,
-    save_checkpoint,
-    load_from_checkpoint,
     gpu_setup,
     get_vae,
 )
+from toy_diffusion.models.aux_models import EMAModel
 from toy_diffusion.paths.sampling import generate_samples
 from toy_diffusion.utils.visualization import (
     visualize_image_grid,

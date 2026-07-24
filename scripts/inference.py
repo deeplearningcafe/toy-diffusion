@@ -97,6 +97,17 @@ def main():
     cfg = OmegaConf.merge(base_conf, cli_conf)
     timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
 
+    if args.checkpoint_dir is not None:
+        cfg.training.resume_from_checkpoint = args.checkpoint_dir
+        ckpt_cfg = load_checkpoint_config(args.checkpoint_dir)
+        ckpt_vocab = load_checkpoint_vocab(args.checkpoint_dir)
+        if ckpt_cfg:
+            for k, v in ckpt_cfg.items():
+                if k not in ["device"]:
+                    cfg.experiment[k] = v
+        if ckpt_vocab:
+            cfg.model["vocab"] = ckpt_vocab
+
     device = cfg.training.device
     if device == "cuda" and not torch.cuda.is_available():
         device = "cpu"
@@ -110,17 +121,7 @@ def main():
         **OmegaConf.to_container(cfg.sampling),
         "device": device,
     }
-
-    if args.checkpoint_dir is not None:
-        cfg.training.resume_from_checkpoint = args.checkpoint_dir
-        ckpt_cfg = load_checkpoint_config(args.checkpoint_dir)
-        ckpt_vocab = load_checkpoint_vocab(args.checkpoint_dir)
-        if ckpt_cfg:
-            for k, v in ckpt_cfg.items():
-                if k not in ["device"]:
-                    config[k] = v
-        if ckpt_vocab:
-            config["vocab"] = ckpt_vocab
+    print(config)
 
     # Setup seed
     seed = config.get("seed", 42)
