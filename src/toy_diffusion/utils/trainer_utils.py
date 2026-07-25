@@ -288,6 +288,7 @@ def get_schedule_loss(config, model, prediction_target, device):
             use_ot=config.get("use_ot", False),
             train_shift=config.get("train_shift", 1.0),
             is_conditional=config.get("is_conditional", False),
+            use_cfm=config.get("use_cfm", False),
         )
     return schedule, loss_fn, model
 

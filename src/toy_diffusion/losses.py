@@ -121,6 +121,7 @@ class GeneralDiffusionLoss(nn.Module):
         use_ot: bool = False,
         train_shift: float = 1.0,
         is_conditional: bool = False,
+        use_cfm: bool = False,
     ):
         super().__init__()
         self.schedule = schedule
@@ -131,6 +132,7 @@ class GeneralDiffusionLoss(nn.Module):
         self.input_perturbation = input_perturbation
         self.use_ot = use_ot
         self.train_shift = train_shift
+        self.use_cfm = use_cfm if is_conditional else False
 
         self.set_conditional(is_conditional)
 
@@ -274,6 +276,14 @@ class GeneralDiffusionLoss(nn.Module):
             # Reshape weights to match batch dim
             weights = weights.view(-1, *([1] * (loss.ndim - 1)))
             loss = loss * weights
+
+        if self.use_cfm:
+            # shifting the target we get uncond contrastive loss
+            cfm_target = torch.roll(target, shifts=1, dims=0)
+            # - as we want this loss to be big st diff conds produce diff preds
+            loss -= 0.05 * torch.nn.functional.mse_loss(
+                pred.to(torch.float32), cfm_target.to(torch.float32), reduction="none"
+            )
 
         # Sum over batch
         return torch.sum(loss) / B

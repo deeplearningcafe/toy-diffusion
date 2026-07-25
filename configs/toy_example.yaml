@@ -50,10 +50,12 @@ diffusion:
   prediction_target: "v" # v, eps, x, consistency
   loss_target: "v" # v, eps, x, consistency
   sampler_type: "dpm-solver"
+  timestep_fn: "logit-normal"
   use_ot: False
   train_shift: 4.63
   sample_shift: 6.93
   clip_prediction: False
+  use_cfm: False
 
 model:
   model_type: "efficient_unet" # mlp, unet, dit
