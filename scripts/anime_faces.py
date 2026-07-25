@@ -79,6 +79,7 @@ def run_anime_faces_experiment(args):
         cfg_dropout_prob=config.get("cfg_dropout_prob", 0.0),
         tag_dropout_prob=config.get("tag_dropout_prob", 0.0),
         use_short_prompts=config.get("use_short_prompts", False),
+        tokenizer=config.get("hf_text_encoder", None),
     )
 
     config["vae_scale"] = dataset.vae_scale

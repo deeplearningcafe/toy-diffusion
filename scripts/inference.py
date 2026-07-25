@@ -154,6 +154,7 @@ def main():
         is_finetune=config.get("is_finetune", False),
         finetune_orig_ratio=config.get("finetune_orig_ratio", 0.05),
         load_into_ram=config.get("load_into_ram", True),
+        tokenizer=config.get("hf_text_encoder", None),
     )
 
     config["vae_scale"] = dataset.vae_scale
@@ -214,4 +215,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

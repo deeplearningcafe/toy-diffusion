@@ -71,6 +71,7 @@ def run_evaluation(args):
         exclude_tags=config.get("exclude_tags", []),
         is_finetune=config.get("is_finetune", False),
         finetune_orig_ratio=config.get("finetune_orig_ratio", 0.05),
+        tokenizer=config.get("hf_text_encoder", None),
     )
 
     config["vae_scale"] = dataset.vae_scale

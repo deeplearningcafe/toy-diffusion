@@ -7,6 +7,11 @@ from torchvision.transforms import InterpolationMode, v2
 from concurrent.futures import ThreadPoolExecutor
 from tqdm import tqdm
 import random
+from toy_diffusion.data.tokenizer import (
+    BaseTokenizer,
+    CommaSeparatedTokenizer,
+    HFLLMTokenizer,
+)
 
 IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".gif", ".webp"}
 
@@ -80,6 +85,7 @@ class ImageDataset(Dataset):
         tag_dropout_prob: float = 0.0,
         use_short_prompts: bool = False,
         tiers_len: list = None,
+        tokenizer: BaseTokenizer | str | None = None,
     ) -> None:
         self.root_dir = Path(root_dir)
         self.num_workers = num_workers
@@ -97,6 +103,14 @@ class ImageDataset(Dataset):
         self.tag_dropout_prob = tag_dropout_prob
         self.use_short_prompts = use_short_prompts
         self.tiers_len = tiers_len
+
+        # Resolve tokenizer
+        if tokenizer is None:
+            self.tokenizer = CommaSeparatedTokenizer()
+        elif isinstance(tokenizer, str):
+            self.tokenizer = HFLLMTokenizer(tokenizer)
+        else:
+            self.tokenizer = tokenizer
 
         print(
             f"Using shuffling {self.shuffle_tags}, cfg prob: {self.cfg_dropout_prob} and tag prob: {self.tag_dropout_prob}"
@@ -155,6 +169,10 @@ class ImageDataset(Dataset):
 
         if self.compute_normalization and self.is_latents:
             self._compute_latents_factors()
+
+    @property
+    def vocab(self):
+        return self.tokenizer.vocab
 
     def _scan_directory_images(self):
         return [
@@ -239,9 +257,7 @@ class ImageDataset(Dataset):
         """
         Builds a simple vocabulary dictionary from the loaded prompts.
         """
-        print("Building vocabulary from prompts...")
-        self.vocab = {"<pad>": 0, "<unk>": 1}
-        # ignore, max is always biggest tier
+        print("Building vocabulary and length stats from prompts...")
         self.max_seq_len = 0
         prompt_lengths = []
 
@@ -250,17 +266,13 @@ class ImageDataset(Dataset):
         else:
             prompts = [self._get_prompt(p) for p in self.img_paths]
 
-        for prompt in prompts:
-            tags = [t.strip() for t in prompt.split(",") if t.strip()]
-            prompt_lengths.append(len(tags))
-            self.max_seq_len = max(self.max_seq_len, len(tags))
-            for tag in tags:
-                if tag not in self.vocab:
-                    self.vocab[tag] = len(self.vocab)
+        # Build vocabulary dynamically if utilizing CommaSeparatedTokenizer
+        if isinstance(self.tokenizer, CommaSeparatedTokenizer):
+            self.tokenizer.build_vocab(prompts)
 
-        print(
-            f"Vocabulary size: {len(self.vocab)}, Max sequence length: {self.max_seq_len}"
-        )
+        for prompt in prompts:
+            length = self.tokenizer.get_length(prompt)
+            prompt_lengths.append(length)
 
         lengths_arr = np.array(prompt_lengths)
         mean_len = np.mean(lengths_arr)
@@ -463,42 +475,13 @@ class ImageDataset(Dataset):
                     self.tensors_list[idx] = norm_lat
 
     def _create_attention_mask(self, prompt):
-        if self.cfg_dropout_prob > 0.0 and random.random() < self.cfg_dropout_prob:
-            tags = []
-        else:
-            tags = [t.strip() for t in prompt.split(",") if t.strip()]
-
-            if len(tags) > 5:
-                first_tags = tags[:5]
-                middle_tags = tags[5:]
-
-                if self.tag_dropout_prob > 0.0:
-                    middle_tags = [
-                        t
-                        for t in middle_tags
-                        if random.random() >= self.tag_dropout_prob
-                    ]
-
-                if self.shuffle_tags:
-                    random.shuffle(middle_tags)
-
-                tags = first_tags + middle_tags
-
-        unk_id = self.vocab.get("<unk>", 1)
-        ids = [self.vocab.get(tag, unk_id) for tag in tags]
-        ids = ids[: self.max_seq_len]
-
-        pad_id = self.vocab.get("<pad>", 0)
-        padded_ids = ids + [pad_id] * (self.max_seq_len - len(ids))
-
-        tokens_tensor = torch.tensor(padded_ids, dtype=torch.long)
-
-        # Attention Mask
-        not_pad_mask = tokens_tensor != pad_id
-        shifted_mask = torch.roll(not_pad_mask, shifts=1, dims=0)
-        shifted_mask[0] = True
-        attention_mask = not_pad_mask | shifted_mask
-        return tokens_tensor, attention_mask
+        return self.tokenizer.encode(
+            prompt,
+            max_len=self.max_seq_len,
+            cfg_dropout_prob=self.cfg_dropout_prob,
+            tag_dropout_prob=self.tag_dropout_prob,
+            shuffle_tags=self.shuffle_tags,
+        )
 
     def __len__(self):
         if self.load_into_ram:

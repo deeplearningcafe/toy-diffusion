@@ -90,6 +90,7 @@ def run_overfit_batch_experiment(args):
         cfg_dropout_prob=config.get("cfg_dropout_prob", 0.0),
         tag_dropout_prob=config.get("tag_dropout_prob", 0.0),
         use_short_prompts=config.get("use_short_prompts", False),
+        tokenizer=config.get("hf_text_encoder", None),
     )
     # here we just get a subset of 1 batch
 
