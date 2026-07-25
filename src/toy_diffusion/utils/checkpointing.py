@@ -15,6 +15,7 @@ def save_checkpoint(
     ema=None,
     config: dict = None,
     vocab: dict = None,
+    skip_text_enc: bool = False,
 ):
     """
     Saves model checkpoint weights, optimizer, scheduler, EMA,
@@ -27,6 +28,18 @@ def save_checkpoint(
     state_dict = model.state_dict()
     clean_state_dict = {k.replace("_orig_mod.", ""): v for k, v in state_dict.items()}
 
+    if skip_text_enc:
+        clean_state_dict = {
+            k: v for k, v in clean_state_dict.items()
+            if not k.startswith("text_enc.")
+        }
+
+    # Cast only floating-point tensors to bfloat16 to halve disk size
+    clean_state_dict = {
+        k: v.to(torch.bfloat16) if v.is_floating_point() else v
+        for k, v in clean_state_dict.items()
+    }
+
     model_path = os.path.join(save_dir, "model.safetensors")
     save_file(clean_state_dict, model_path)
 
@@ -34,6 +47,18 @@ def save_checkpoint(
         ema_state_dict = ema.ema_model.state_dict()
         clean_ema_state_dict = {
             k.replace("_orig_mod.", ""): v for k, v in ema_state_dict.items()
+        }
+
+        if skip_text_enc:
+            clean_ema_state_dict = {
+                k: v for k, v in clean_ema_state_dict.items()
+                if not k.startswith("text_enc.")
+            }
+
+        # Cast EMA floating point tensors
+        clean_ema_state_dict = {
+            k: v.to(torch.bfloat16) if v.is_floating_point() else v
+            for k, v in clean_ema_state_dict.items()
         }
         ema_path = os.path.join(save_dir, "ema_model.safetensors")
         save_file(clean_ema_state_dict, ema_path)
@@ -111,6 +136,7 @@ def load_from_checkpoint(
     optimizer=None,
     scheduler=None,
     ema=None,
+    skip_text_enc: bool = False,
 ) -> tuple[int, dict, dict]:
     """
     Loads states from a checkpoint directory.
@@ -118,6 +144,7 @@ def load_from_checkpoint(
     """
     logging.info(f"Loading checkpoint from {checkpoint_dir}")
 
+    strict = True if not skip_text_enc else False
     if model is not None:
         model_path = os.path.join(checkpoint_dir, "model.safetensors")
         if os.path.exists(model_path):
@@ -125,7 +152,7 @@ def load_from_checkpoint(
             sanitized_dict = {
                 k.replace("_orig_mod.", ""): v for k, v in state_dict.items()
             }
-            model.load_state_dict(sanitized_dict)
+            model.load_state_dict(sanitized_dict, strict=strict)
 
     if ema is not None and getattr(ema, "use_ema", False):
         ema_path = os.path.join(checkpoint_dir, "ema_model.safetensors")
@@ -133,7 +160,7 @@ def load_from_checkpoint(
             if ema.ema_model is None and model is not None:
                 ema.initialize(model)
             if ema.ema_model is not None:
-                ema.ema_model.load_state_dict(load_file(ema_path))
+                ema.ema_model.load_state_dict(load_file(ema_path), strict=strict)
 
     if optimizer is not None:
         opt_path = os.path.join(checkpoint_dir, "optimizer.pt")

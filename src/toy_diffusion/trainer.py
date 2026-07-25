@@ -133,6 +133,7 @@ class Trainer:
                 optimizer=self.optimizer,
                 scheduler=self.scheduler,
                 ema=self.ema,
+                skip_text_enc=True if config.get("hf_text_encoder", None) else False,
             )
             if ckpt_vocab and "vocab" not in self.config:
                 self.config["vocab"] = ckpt_vocab
@@ -151,6 +152,8 @@ class Trainer:
             if isinstance(self.model, torch.nn.ModuleDict) and "unet" in self.model:
                 self.model["unet"] = torch.compile(self.model["unet"])
                 # skip text encoder compile
+                if config.get("hf_text_encoder", None):
+                    self.model["text_enc"] = torch.compile(self.model["text_enc"])
             else:
                 self.model = torch.compile(self.model)
 
@@ -332,6 +335,7 @@ class Trainer:
                     ema=self.ema,
                     config=self.config,
                     vocab=vocab,
+                    skip_text_enc=True if config.get("hf_text_encoder", None) else False,
                 )
 
         return self.model

@@ -380,7 +380,10 @@ class DualStreamDiT(nn.Module):
         # not used in orig i1 paper
         if self.use_rope_text_adapter:
             text_len = encoder_hidden_states.shape[1]
-            rotary_emb = torch.cat([cos, sin], dim=-1)
+            # Expand cos and sin to full HeadDim for apply_rotary_emb
+            cos_full = torch.cat([cos, cos], dim=-1)
+            sin_full = torch.cat([sin, sin], dim=-1)
+            rotary_emb = torch.cat([cos_full, sin_full], dim=-1)
             # first token is time step
             text_rotary_emb = rotary_emb[:, 1 : 1 + text_len]
 

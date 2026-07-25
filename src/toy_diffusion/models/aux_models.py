@@ -4,7 +4,7 @@ from pathlib import Path
 import json
 import copy
 import contextlib
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoModel, AutoTokenizer
 
 
 class EMAModel:
@@ -92,7 +92,7 @@ class HFTextEncoder(nn.Module):
                 self.tokenizer.pad_token_id = self.tokenizer.eos_token_id or 0
 
         # Load model in bfloat16 to save memory
-        self.model = AutoModelForCausalLM.from_pretrained(
+        self.model = AutoModel.from_pretrained(
             model_id, torch_dtype=torch.bfloat16
         )
         self.model.eval()
@@ -111,7 +111,7 @@ class HFTextEncoder(nn.Module):
                 return_tensors="pt",
             ).to(device)
             input_ids = encoded["input_ids"]
-            attention_mask = encoded["attention_mask"]
+            attention_mask = encoded["attention_mask"].bool()
         else:
             input_ids, attention_mask = inputs
             input_ids = input_ids.to(device)
@@ -121,11 +121,11 @@ class HFTextEncoder(nn.Module):
             outputs = self.model(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
-                output_hidden_states=True,
                 return_dict=True,
             )
-            # Get the final hidden state from the last layer (before LM head)
-            embeds = outputs.hidden_states[-1]
+            # Directly extract the final hidden layer without storing layers
+            embeds = outputs.last_hidden_state
+
 
         return embeds, attention_mask
 
