@@ -440,13 +440,29 @@ class Attention(nn.Module):
         self, x, encoder_hidden_states=None, attention_mask=None, image_rotary_emb=None
     ):
         batch, T, C = x.shape
-        q = self.to_q(x)
-
-        encoder_hidden_states = (
-            encoder_hidden_states if encoder_hidden_states is not None else x
-        )
-        k = self.to_k(encoder_hidden_states)
-        v = self.to_v(encoder_hidden_states)
+        
+        # Dynamic QKV/KV linear fusion
+        if encoder_hidden_states is None or encoder_hidden_states is x:
+            if self.cross_attention_dim == self.in_channels:
+                qkv_w = torch.cat(
+                    [self.to_q.weight, self.to_k.weight, self.to_v.weight],
+                    dim=0,
+                )
+                qkv = F.linear(x, qkv_w)
+                q, k, v = torch.split(
+                    qkv,
+                    [self.in_channels, self.kv_dim, self.kv_dim],
+                    dim=-1,
+                )
+            else:
+                q = self.to_q(x)
+                k = self.to_k(x)
+                v = self.to_v(x)
+        else:
+            q = self.to_q(x)
+            kv_w = torch.cat([self.to_k.weight, self.to_v.weight], dim=0)
+            kv = F.linear(encoder_hidden_states, kv_w)
+            k, v = torch.split(kv, [self.kv_dim, self.kv_dim], dim=-1)
 
         # reshape with multi heads
         # GQA: q[B, H*W, C] -> [B, H*W, Heads, C/Heads], k: [B, T, C] -> [B, H*W, KV_Heads, C/KV_Heads]
@@ -503,13 +519,27 @@ class Attention(nn.Module):
     ):
         # the input is [B, T, C]
         B, T, C = x.shape
-        q = self.to_q(x)
-
-        encoder_hidden_states = (
-            encoder_hidden_states if encoder_hidden_states is not None else x
-        )
-        k = self.to_k(encoder_hidden_states)
-        v = self.to_v(encoder_hidden_states)
+        if encoder_hidden_states is None or encoder_hidden_states is x:
+            if self.cross_attention_dim == self.in_channels:
+                qkv_w = torch.cat(
+                    [self.to_q.weight, self.to_k.weight, self.to_v.weight],
+                    dim=0,
+                )
+                qkv = F.linear(x, qkv_w)
+                q, k, v = torch.split(
+                    qkv,
+                    [self.in_channels, self.kv_dim, self.kv_dim],
+                    dim=-1,
+                )
+            else:
+                q = self.to_q(x)
+                k = self.to_k(x)
+                v = self.to_v(x)
+        else:
+            q = self.to_q(x)
+            kv_w = torch.cat([self.to_k.weight, self.to_v.weight], dim=0)
+            kv = F.linear(encoder_hidden_states, kv_w)
+            k, v = torch.split(kv, [self.kv_dim, self.kv_dim], dim=-1)
 
         # q [B, H*W, Heads, HeadDim], k [B, T, KV_Heads, HeadDim]
         q = q.view(B, -1, self.num_attention_heads, self.head_dim)
@@ -558,14 +588,42 @@ class GEGLU(nn.Module):
         hidden_states, gate = self.proj_in(x).chunk(2, dim=-1)
         return hidden_states * torch.nn.functional.gelu(gate)
 
+class SwiGLU(nn.Module):
+    """
+    Swish Gated Linear Unit (SwiGLU) activation module.
+    """
+    def __init__(self, in_channels, out_channels, bias=True) -> None:
+        super().__init__()
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.bias = bias
+        self.proj_in = nn.Linear(
+            in_features=self.in_channels,
+            out_features=self.out_channels * 2,
+            bias=self.bias,
+        )
+
+    def forward(self, x):
+        hidden_states, gate = self.proj_in(x).chunk(2, dim=-1)
+        return hidden_states * torch.nn.functional.silu(gate)
 
 class Feedforward(nn.Module):
-    def __init__(self, in_channels, expansion_ratio=4) -> None:
+    def __init__(self, in_channels, expansion_ratio=4, activation_func: str = "geglu") -> None:
         super().__init__()
         self.in_channels = in_channels
         hidden_channels = int(in_channels * expansion_ratio)
 
-        self.geglu = GEGLU(self.in_channels, hidden_channels, bias=True)
+        if activation_func == "geglu":
+            self.geglu = GEGLU(
+                self.in_channels, hidden_channels, bias=True
+            )
+        elif activation_func == "swiglu":
+            self.geglu = SwiGLU(
+                self.in_channels, hidden_channels, bias=True
+            )
+        else:
+            raise ValueError(f"Unknown activation: {activation_func}")
+
         self.proj_out = nn.Linear(
             in_features=hidden_channels, out_features=self.in_channels, bias=True
         )
@@ -588,6 +646,8 @@ class TransformerBlock(nn.Module):
         qk_norm: str = None,
         kv_num_heads: int = None,
         ffn_expansion_ratio: int = 4,
+        norm_type: str = "layer_norm",
+        activation_func: str = "geglu",
     ):
         super().__init__()
         self.in_channels = in_channels
@@ -596,9 +656,17 @@ class TransformerBlock(nn.Module):
         self.use_checkpointing = use_checkpointing
         self.disable_self_attention = disable_self_attention
 
+        def get_norm(dim):
+            if norm_type == "layer_norm":
+                return nn.LayerNorm(dim)
+            elif norm_type == "rms_norm":
+                return nn.RMSNorm(dim)
+            else:
+                raise ValueError(f"Unknown norm_type: {norm_type}")
+
         # self attn
         if not self.disable_self_attention:
-            self.norm1 = nn.LayerNorm(self.in_channels)
+            self.norm1 = get_norm(self.in_channels)
             self.attn1 = Attention(
                 in_channels=self.in_channels,
                 num_attention_heads=self.num_attention_heads,
@@ -608,7 +676,7 @@ class TransformerBlock(nn.Module):
 
         # cross attn
         if cross_attention_dim is not None:
-            self.norm2 = nn.LayerNorm(self.in_channels)
+            self.norm2 = get_norm(self.in_channels)
             self.attn2 = Attention(
                 in_channels=self.in_channels,
                 num_attention_heads=self.num_attention_heads,
@@ -618,8 +686,12 @@ class TransformerBlock(nn.Module):
             )
 
         # feed forward
-        self.norm3 = nn.LayerNorm(self.in_channels)
-        self.ff = Feedforward(self.in_channels, expansion_ratio=ffn_expansion_ratio)
+        self.norm3 = get_norm(self.in_channels)
+        self.ff = Feedforward(
+            self.in_channels,
+            expansion_ratio=ffn_expansion_ratio,
+            activation_func=activation_func,
+        )
 
     def forward(
         self, x, encoder_hidden_states, attention_mask=None, image_rotary_emb=None

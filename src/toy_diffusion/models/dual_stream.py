@@ -19,16 +19,23 @@ def _apply_multimodal_rope(
         return x
     cos, sin = freqs
     dtype = x.dtype
+    sh = x.shape
     # x shape: [B, SeqLen, Heads, HeadDim]
-    x_pair = x.float().reshape(*x.shape[:-1], x.shape[-1] // 2, 2)
-    x0, x1 = x_pair.unbind(dim=-1)
+    # reshape instead of unbind+stack
+    x_pair = x.float().view(*sh[:-1], sh[-1] // 2, 2)
+    x0 = x_pair[..., 0]
+    x1 = x_pair[..., 1]
+
 
     # cos, sin shape: [B, SeqLen, HeadDim // 2] -> [B, SeqLen, 1, HeadDim // 2]
     cos = cos.unsqueeze(2).float()
     sin = sin.unsqueeze(2).float()
 
-    out = torch.stack((x0 * cos - x1 * sin, x0 * sin + x1 * cos), dim=-1)
-    return out.reshape_as(x).to(dtype)
+    out0 = x0 * cos - x1 * sin
+    out1 = x0 * sin + x1 * cos
+    out = torch.stack((out0, out1), dim=-1)
+    return out.view(sh).to(dtype)
+
 
 
 class SwiGLUFFN(nn.Module):

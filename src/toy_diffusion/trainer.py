@@ -335,7 +335,7 @@ class Trainer:
                     ema=self.ema,
                     config=self.config,
                     vocab=vocab,
-                    skip_text_enc=True if config.get("hf_text_encoder", None) else False,
+                    skip_text_enc=True if self.config.get("hf_text_encoder", None) else False,
                 )
 
         return self.model

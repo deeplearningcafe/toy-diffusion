@@ -118,7 +118,8 @@ def run_profiling(args):
         patch_torch_compile()
         if isinstance(model, torch.nn.ModuleDict) and "unet" in model:
             model["unet"] = torch.compile(model["unet"])
-            # skip text_enc
+            if config.get("hf_text_encoder", None):
+                model["text_enc"] = torch.compile(model["text_enc"])
         else:
             model = torch.compile(model)
 
