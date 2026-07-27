@@ -200,6 +200,8 @@ class LuminaNextDit(nn.Module):
         use_skip: bool = False,
         use_checkpointing: bool = True,
         use_rope_text_adapter: bool = False,
+        norm_type: str = "layer_norm",
+        activation_func: str = "geglu",
     ):
         super().__init__()
         self.patch_size = patch_size
@@ -234,6 +236,8 @@ class LuminaNextDit(nn.Module):
                 num_attention_heads=num_attention_heads,
                 ffn_expansion_ratio=4.0,
                 use_checkpointing=use_checkpointing,
+                norm_type=norm_type,
+                activation_func=activation_func,
             )
             self.image_refiner = nn.ModuleList(
                 [

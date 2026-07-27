@@ -143,6 +143,8 @@ def get_model(config, device):
             depth=config["depth"],
             use_checkpointing=config.get("use_gradient_checkpointing", False),
             use_rope_text_adapter=config.get("use_rope_text_adapter", False),
+            norm_type=config.get("norm_type", "layer_norm"),
+            activation_func=config.get("activation_func", "geglu"),
         ).to(device)
 
         model = (
@@ -164,6 +166,8 @@ def get_model(config, device):
             depth=config["depth"],
             use_checkpointing=config.get("use_gradient_checkpointing", False),
             use_rope_text_adapter=config.get("use_rope_text_adapter", False),
+            norm_type=config.get("norm_type", "layer_norm"),
+            activation_func=config.get("activation_func", "geglu"),
         ).to(device)
 
         model = (
@@ -176,10 +180,18 @@ def get_model(config, device):
         if config["model_type"] == "sprint_single":
             unet = SprintLuminaNextDit(
                 in_channels=in_channels,
+                out_channels=in_channels,
                 hidden_size=config["hidden_dim"],
-                depth=config["depth"],
-                num_attention_heads=config.get("num_heads", 16),
+                num_attention_heads=config.get("num_heads", 12),
+                num_kv_heads=config.get("num_kv_heads", 4),
+                use_i1=config.get("use_i1", True),
+                use_skip=config.get("use_i1", True),
                 cross_attention_dim=cross_attention_dim,
+                depth=config["depth"],
+                use_checkpointing=config.get("use_gradient_checkpointing", False),
+                use_rope_text_adapter=config.get("use_rope_text_adapter", False),
+                norm_type=config.get("norm_type", "layer_norm"),
+                activation_func=config.get("activation_func", "geglu"),
                 encoder_depth=config.get("encoder_depth", 2),
                 decoder_depth=config.get("decoder_depth", 2),
                 drop_ratio=config.get("drop_ratio", 0.75),
@@ -201,6 +213,8 @@ def get_model(config, device):
                 drop_target=config.get("drop_target", "image"),
                 residual_type=config.get("residual_type", "concat_linear"),
                 cfg_mask_prob=config.get("cfg_mask_prob", 0.1),
+                norm_type=config.get("norm_type", "layer_norm"),
+                activation_func=config.get("activation_func", "geglu"),
             ).to(device)
 
         model = (

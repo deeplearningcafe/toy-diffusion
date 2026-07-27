@@ -153,7 +153,10 @@ class Trainer:
                 self.model["unet"] = torch.compile(self.model["unet"])
                 # skip text encoder compile
                 if config.get("hf_text_encoder", None):
-                    self.model["text_enc"] = torch.compile(self.model["text_enc"])
+                    # don't compile tokenization
+                    self.model["text_enc"].model = torch.compile(
+                        self.model["text_enc"].model
+                    )
             else:
                 self.model = torch.compile(self.model)
 
@@ -308,7 +311,7 @@ class Trainer:
 
             loss = self.train_epoch(dataloader)
 
-            if (epoch + 1) % log_interval == 0:
+            if (epoch + 1) % log_interval == 0 or (epoch+1) == epochs:
                 if isinstance(self.optimizer, dict):
                     lr_val = self.optimizer["G"].param_groups[0]["lr"]
                 else:
@@ -318,10 +321,10 @@ class Trainer:
                     f"[Epoch {epoch + 1}/{epochs}] Loss: {loss:.6f} LR: {lr_val:.3e}"
                 )
 
-            if (epoch + 1) % sample_interval == 0:
+            if (epoch + 1) % sample_interval == 0 or (epoch+1) == epochs:
                 self.run_sampling(timestamp, epoch, num_steps)
 
-            if save_interval > 0 and (epoch + 1) % save_interval == 0:
+            if save_interval > 0 and (epoch + 1) % save_interval == 0 or (epoch+1) == epochs:
                 vocab = getattr(self.dataset, "vocab", None)
                 if vocab is None:
                     vocab = self.config.get("vocab", None)

@@ -124,7 +124,8 @@ class HFLLMTokenizer(BaseTokenizer):
 
     @property
     def vocab(self) -> dict:
-        return self.tokenizer.get_vocab()
+        # there is no need to save it as defined by llm
+        return None
 
     def get_length(self, prompt: str) -> int:
         return len(self.tokenizer.encode(prompt, add_special_tokens=True))

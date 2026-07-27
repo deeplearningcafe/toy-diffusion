@@ -238,6 +238,8 @@ class DualStreamDiT(nn.Module):
         use_checkpointing: bool = True,
         eps: float = 1e-5,
         use_rope_text_adapter: bool = False,
+        norm_type: str = "layer_norm",
+        activation_func: str = "geglu",
     ) -> None:
         super().__init__()
         self.in_channels = in_channels
@@ -267,6 +269,8 @@ class DualStreamDiT(nn.Module):
             num_attention_heads=num_heads,
             ffn_expansion_ratio=mlp_ratio,
             use_checkpointing=self.use_checkpointing,
+            norm_type=norm_type,
+            activation_func=activation_func,
         )
 
         # 4. 3D RoPE

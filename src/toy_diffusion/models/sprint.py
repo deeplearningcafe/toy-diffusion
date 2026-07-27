@@ -55,6 +55,7 @@ class SprintLuminaNextDit(LuminaNextDit):
         self,
         patch_size: int = 2,
         in_channels: int = 4,
+        out_channels: int = 4,
         hidden_size: int = 1152,
         depth: int = 28,
         num_attention_heads: int = 16,
@@ -67,12 +68,19 @@ class SprintLuminaNextDit(LuminaNextDit):
         drop_ratio: float = 0.75,
         residual_type: str = "concat_linear",
         cfg_mask_prob: float = 0.1,
+        use_i1: bool = False,
+        use_skip: bool = False,
+        use_checkpointing: bool = True,
+        use_rope_text_adapter: bool = False,
+        norm_type: str = "rms_norm",
+        activation_func: str = "swiglu",
     ):
         # Prevent base constructor block initialization
         nn.Module.__init__(self)
 
         self.patch_size = patch_size
         self.in_channels = in_channels
+        self.out_channels = out_channels
         self.hidden_size = hidden_size
         self.encoder_depth = encoder_depth
         self.decoder_depth = decoder_depth
@@ -80,6 +88,9 @@ class SprintLuminaNextDit(LuminaNextDit):
         self.drop_ratio = drop_ratio
         self.residual_type = residual_type
         self.cfg_mask_prob = cfg_mask_prob
+        self.use_i1 = use_i1
+        self.use_checkpointing = use_checkpointing
+        self.use_rope_text_adapter = use_rope_text_adapter
 
         # Patch Embedder
         self.x_embedder = nn.Linear(
@@ -93,6 +104,40 @@ class SprintLuminaNextDit(LuminaNextDit):
             output_dim=hidden_size,
         )
 
+        if self.use_i1:
+            self.time_token_proj = nn.Sequential(
+                nn.SiLU(), nn.Linear(hidden_size, hidden_size)
+            )
+            self.text_adapter = TransformerTextAdapter(
+                in_channels=cross_attention_dim,
+                hidden_size=hidden_size,
+                num_layers=2,
+                num_attention_heads=num_attention_heads,
+                ffn_expansion_ratio=4.0,
+                use_checkpointing=use_checkpointing,
+                norm_type=norm_type,
+                activation_func=activation_func,
+            )
+            self.image_refiner = nn.ModuleList(
+                [
+                    LuminaNextDiTBlock(
+                        dim=hidden_size,
+                        num_attention_heads=num_attention_heads,
+                        num_kv_heads=num_kv_heads,
+                        eps=eps,
+                        base_sequence_length=None,
+                        use_i1=True,
+                        use_checkpointing=use_checkpointing,
+                    )
+                    for _ in range(2)
+                ]
+            )
+            head_dim = hidden_size // num_attention_heads
+            axes_dims = _default_rope_axes_dims(head_dim)
+            self.rope_embedder = MultimodalRopeEmbedder(axes_dims)
+        else:
+            self.cap_embedder = nn.Linear(cross_attention_dim, hidden_size)
+
         # Encoder stage (Dense)
         self.encoder_blocks = nn.ModuleList(
             [
@@ -100,9 +145,10 @@ class SprintLuminaNextDit(LuminaNextDit):
                     dim=hidden_size,
                     num_attention_heads=num_attention_heads,
                     num_kv_heads=num_kv_heads,
-                    cross_attention_dim=cross_attention_dim,
                     eps=eps,
                     base_sequence_length=base_sequence_length,
+                    use_i1=self.use_i1,
+                    use_checkpointing=use_checkpointing,
                 )
                 for _ in range(self.encoder_depth)
             ]
@@ -115,9 +161,10 @@ class SprintLuminaNextDit(LuminaNextDit):
                     dim=hidden_size,
                     num_attention_heads=num_attention_heads,
                     num_kv_heads=num_kv_heads,
-                    cross_attention_dim=cross_attention_dim,
                     eps=eps,
                     base_sequence_length=base_sequence_length,
+                    use_i1=self.use_i1,
+                    use_checkpointing=use_checkpointing,
                 )
                 for _ in range(self.middle_depth)
             ]
@@ -130,9 +177,10 @@ class SprintLuminaNextDit(LuminaNextDit):
                     dim=hidden_size,
                     num_attention_heads=num_attention_heads,
                     num_kv_heads=num_kv_heads,
-                    cross_attention_dim=cross_attention_dim,
                     eps=eps,
                     base_sequence_length=base_sequence_length,
+                    use_i1=self.use_i1,
+                    use_checkpointing=use_checkpointing,
                 )
                 for _ in range(self.decoder_depth)
             ]
@@ -140,108 +188,249 @@ class SprintLuminaNextDit(LuminaNextDit):
 
         # Output projection
         self.norm_out = nn.RMSNorm(hidden_size, eps=eps)
-        self.proj_out = nn.Linear(hidden_size, patch_size * patch_size * in_channels)
+        self.proj_out = nn.Linear(
+            hidden_size, patch_size * patch_size * out_channels
+        )
 
         self.mask_token = nn.Parameter(torch.zeros(self.hidden_size))
         torch.nn.init.normal_(self.mask_token, std=0.02)
 
         if self.residual_type == "concat_linear":
-            self.renoise_linear = nn.Linear(self.hidden_size * 2, self.hidden_size)
+            self.renoise_linear = nn.Linear(
+                self.hidden_size * 2, self.hidden_size
+            )
             torch.nn.init.xavier_uniform_(self.renoise_linear.weight)
             nn.init.zeros_(self.renoise_linear.bias)
+
+        self._zero_initialize_output()
 
     def forward(
         self,
         x: torch.Tensor,
         t: torch.Tensor,
         encoder_hidden_states: torch.Tensor = None,
+        attention_mask: torch.Tensor = None,
         image_rotary_emb: torch.Tensor = None,
     ):
-        x, (H, W) = self.patchify(x)
-        x = self.x_embedder(x)
+        bsz, _, H, W = x.shape
+        p = self.patch_size
+        h_patches, w_patches = H // p, W // p
 
-        temb = self.time_embedding(t, x)
+        x_patches, (H, W) = self.patchify(x)
+        img_tokens = self.x_embedder(x_patches)
 
-        # Encoder blocks
+        t_emb = self.time_embedding(t, x)
+
+        if self.use_i1:
+            time_token = self.time_token_proj(t_emb).unsqueeze(1)
+
+            if attention_mask is not None:
+                time_mask = torch.ones(
+                    (bsz, 1), dtype=torch.bool, device=x.device
+                )
+                full_text_mask = torch.cat(
+                    [time_mask, attention_mask.bool()], dim=1
+                )
+            else:
+                full_text_mask = torch.ones(
+                    (bsz, encoder_hidden_states.shape[1] + 1),
+                    dtype=torch.bool,
+                    device=x.device,
+                )
+
+            all_pos_ids = self._build_position_ids(
+                full_text_mask, h_patches, w_patches
+            )
+            cos, sin = self.rope_embedder(all_pos_ids)
+
+            cos_full = torch.cat([cos, cos], dim=-1)
+            sin_full = torch.cat([sin, sin], dim=-1)
+            rotary_emb = torch.cat([cos_full, sin_full], dim=-1)
+
+            text_len = encoder_hidden_states.shape[1]
+            text_rotary_emb = None
+            if self.use_rope_text_adapter:
+                text_rotary_emb = rotary_emb[:, 1 : 1 + text_len]
+            img_rotary_emb = rotary_emb[:, 1 + text_len :]
+
+            text_tokens = self.text_adapter(
+                encoder_hidden_states,
+                attention_mask=attention_mask,
+                text_rotary_emb=text_rotary_emb,
+            )
+            text_tokens = torch.cat([time_token, text_tokens], dim=1)
+
+            for block in self.image_refiner:
+                img_tokens = block(img_tokens, image_rotary_emb=img_rotary_emb)
+
+            hidden_states = torch.cat([text_tokens, img_tokens], dim=1)
+
+            img_mask = torch.ones(
+                (bsz, img_tokens.shape[1]),
+                dtype=torch.bool,
+                device=x.device,
+            )
+            full_mask = torch.cat([full_text_mask, img_mask], dim=1)
+        else:
+            if encoder_hidden_states is not None:
+                text_tokens = self.cap_embedder(encoder_hidden_states)
+                hidden_states = torch.cat([text_tokens, img_tokens], dim=1)
+
+                if attention_mask is not None:
+                    img_mask = torch.ones(
+                        (bsz, img_tokens.shape[1]),
+                        dtype=torch.bool,
+                        device=x.device,
+                    )
+                    full_mask = torch.cat(
+                        [attention_mask.bool(), img_mask], dim=1
+                    )
+                else:
+                    full_mask = None
+            else:
+                hidden_states = img_tokens
+                full_mask = None
+            rotary_emb = image_rotary_emb
+
+        # Encoder stage (Dense)
         for block in self.encoder_blocks:
-            x = block(
-                hidden_states=x,
-                temb=temb,
-                encoder_hidden_states=encoder_hidden_states,
-                image_rotary_emb=image_rotary_emb,
+            hidden_states = block(
+                hidden_states=hidden_states,
+                temb=t_emb,
+                attention_mask=full_mask,
+                image_rotary_emb=rotary_emb,
             )
 
-        mask_token_3d = self.mask_token.view(1, 1, -1)
-        x_clone = x.clone()
+        img_len = img_tokens.shape[1]
+        text_len = hidden_states.shape[1] - img_len
+
+        text_part = hidden_states[:, :text_len]
+        img_part = hidden_states[:, text_len:]
+        img_part_clone = img_part.clone()
+
+        if full_mask is not None:
+            text_mask = full_mask[:, :text_len]
+            img_mask = full_mask[:, text_len:]
+        else:
+            text_mask = None
+            img_mask = None
+
+        if rotary_emb is not None:
+            text_rotary_emb = rotary_emb[:, :text_len]
+            img_rotary_emb = rotary_emb[:, text_len:]
+        else:
+            text_rotary_emb = None
+            img_rotary_emb = None
+
         should_drop = self.training and (self.drop_ratio > 0.0)
 
         # SPRINT token dropping
         if should_drop:
-            x_sparse, ids_keep, ids_restore = random_token_drop(x, self.drop_ratio)
+            img_part_sparse, ids_keep, ids_restore = random_token_drop(
+                img_part, self.drop_ratio
+            )
+            if img_mask is not None:
+                img_mask_sparse = torch.gather(img_mask, dim=1, index=ids_keep)
+            else:
+                img_mask_sparse = None
 
-            if image_rotary_emb is not None:
-                B_emb = image_rotary_emb.shape[0]
+            if img_rotary_emb is not None:
+                B_emb = img_rotary_emb.shape[0]
                 if B_emb == 1:
-                    image_rotary_emb_expanded = image_rotary_emb.expand(
-                        x.shape[0], -1, -1
+                    img_rotary_emb_expanded = img_rotary_emb.expand(
+                        img_part.shape[0], -1, -1
                     )
                 else:
-                    image_rotary_emb_expanded = image_rotary_emb
-                D_emb = image_rotary_emb_expanded.shape[-1]
-                image_rotary_emb_sparse = torch.gather(
-                    image_rotary_emb_expanded,
+                    img_rotary_emb_expanded = img_rotary_emb
+                D_emb = img_rotary_emb_expanded.shape[-1]
+                img_rotary_emb_sparse = torch.gather(
+                    img_rotary_emb_expanded,
                     dim=1,
                     index=ids_keep.unsqueeze(-1).expand(-1, -1, D_emb),
                 )
             else:
-                image_rotary_emb_sparse = None
+                img_rotary_emb_sparse = None
         else:
-            x_sparse = x
-            image_rotary_emb_sparse = image_rotary_emb
+            img_part_sparse = img_part
+            img_mask_sparse = img_mask
+            img_rotary_emb_sparse = img_rotary_emb
 
-        # Middle blocks
+        hidden_states_sparse = torch.cat(
+            [text_part, img_part_sparse], dim=1
+        )
+        if full_mask is not None:
+            full_mask_sparse = torch.cat(
+                [text_mask, img_mask_sparse], dim=1
+            )
+        else:
+            full_mask_sparse = None
+
+        if rotary_emb is not None:
+            rotary_emb_sparse = torch.cat(
+                [text_rotary_emb, img_rotary_emb_sparse], dim=1
+            )
+        else:
+            rotary_emb_sparse = None
+
+        # Middle stage (Sparse)
         for block in self.middle_blocks:
-            x_sparse = block(
-                hidden_states=x_sparse,
-                temb=temb,
-                encoder_hidden_states=encoder_hidden_states,
-                image_rotary_emb=image_rotary_emb_sparse,
+            hidden_states_sparse = block(
+                hidden_states=hidden_states_sparse,
+                temb=t_emb,
+                attention_mask=full_mask_sparse,
+                image_rotary_emb=rotary_emb_sparse,
             )
 
         # Sequence restoration
+        text_part_sparse = hidden_states_sparse[:, :text_len]
+        img_part_sparse = hidden_states_sparse[:, text_len:]
+
         if should_drop:
-            x = restore_full_sequence(x_sparse, ids_restore, mask_token_3d)
+            mask_token_3d = self.mask_token.view(1, 1, -1)
+            img_part_restored = restore_full_sequence(
+                img_part_sparse, ids_restore, mask_token_3d
+            )
         else:
-            x = x_sparse
+            img_part_restored = img_part_sparse
 
         # SPRINT Path-drop CFG mask (training only)
         if self.training and self.cfg_mask_prob > 0:
             B_sz = x.shape[0]
             sample_mask = torch.rand(B_sz, device=x.device) < self.cfg_mask_prob
-            mask_tokens_expanded = mask_token_3d.expand(B_sz, x.shape[1], x.shape[2])
-            x = torch.where(
-                sample_mask.unsqueeze(1).unsqueeze(2), mask_tokens_expanded, x
+            mask_tokens_expanded = self.mask_token.view(1, 1, -1).expand(
+                B_sz, img_len, self.hidden_size
+            )
+            img_part_restored = torch.where(
+                sample_mask.unsqueeze(1).unsqueeze(2),
+                mask_tokens_expanded,
+                img_part_restored,
             )
 
-        # SPRINT Residual Fusion
-        if should_drop and self.residual_type == "concat_linear":
-            x = torch.cat([x, x_clone], dim=-1)
-            x = self.renoise_linear(x)
+        # SPRINT Residual Fusion (applied unconditionally for consistency)
+        if self.residual_type == "concat_linear":
+            img_part_restored = torch.cat(
+                [img_part_restored, img_part_clone], dim=-1
+            )
+            img_part_restored = self.renoise_linear(img_part_restored)
 
-        # Decoder blocks
+        hidden_states = torch.cat(
+            [text_part_sparse, img_part_restored], dim=1
+        )
+
+        # Decoder stage (Dense)
         for block in self.decoder_blocks:
-            x = block(
-                hidden_states=x,
-                temb=temb,
-                encoder_hidden_states=encoder_hidden_states,
-                image_rotary_emb=image_rotary_emb,
+            hidden_states = block(
+                hidden_states=hidden_states,
+                temb=t_emb,
+                attention_mask=full_mask,
+                image_rotary_emb=rotary_emb,
             )
 
-        x = self.norm_out(x)
-        x = self.proj_out(x)
-        x = self.unpatchify(x, H, W)
+        hidden_states = hidden_states[:, -img_len:]
+        hidden_states = self.norm_out(hidden_states)
+        hidden_states = self.proj_out(hidden_states)
+        x = self.unpatchify(hidden_states, H, W)
         return x
-
 
 class SprintDualStreamDiT(DualStreamDiT):
     """
@@ -267,6 +456,9 @@ class SprintDualStreamDiT(DualStreamDiT):
         drop_target: str = "image",
         residual_type: str = "concat_linear",
         cfg_mask_prob: float = 0.1,
+        use_rope_text_adapter: bool = False,
+        norm_type: str = "layer_norm",
+        activation_func: str = "geglu",
     ):
         # Prevent base constructor block initialization
         nn.Module.__init__(self)
@@ -283,6 +475,7 @@ class SprintDualStreamDiT(DualStreamDiT):
         self.drop_target = drop_target
         self.residual_type = residual_type
         self.cfg_mask_prob = cfg_mask_prob
+        self.use_rope_text_adapter = use_rope_text_adapter
 
         # 1. Image Embedder
         self.x_embedder = nn.Conv2d(
@@ -303,6 +496,8 @@ class SprintDualStreamDiT(DualStreamDiT):
             num_attention_heads=num_heads,
             ffn_expansion_ratio=mlp_ratio,
             use_checkpointing=self.use_checkpointing,
+            norm_type=norm_type,
+            activation_func=activation_func,
         )
 
         # 4. 3D RoPE
@@ -413,19 +608,34 @@ class SprintDualStreamDiT(DualStreamDiT):
         t_emb = self.time_embedding(t, x)
         time_token = self.time_token_proj(t_emb).unsqueeze(1)
 
-        text_tokens = self.text_adapter(
-            encoder_hidden_states, attention_mask=attention_mask
-        )
-        text_tokens = torch.cat([time_token, text_tokens], dim=1)
-
         time_mask = torch.ones((bsz, 1), dtype=torch.bool, device=x.device)
         text_mask = torch.cat([time_mask, attention_mask.bool()], dim=1)
 
+        # 3D RoPE Frequencies
         text_pos_ids, image_pos_ids = self._build_position_ids(
             text_mask, h_patches, w_patches
         )
         all_pos_ids = torch.cat([text_pos_ids, image_pos_ids], dim=1)
         cos, sin = self.rope_embedder(all_pos_ids)
+
+        text_rotary_emb = None
+        # not used in orig i1 paper
+        if self.use_rope_text_adapter:
+            text_len = encoder_hidden_states.shape[1]
+            # Expand cos and sin to full HeadDim for apply_rotary_emb
+            cos_full = torch.cat([cos, cos], dim=-1)
+            sin_full = torch.cat([sin, sin], dim=-1)
+            rotary_emb = torch.cat([cos_full, sin_full], dim=-1)
+            # first token is time step
+            text_rotary_emb = rotary_emb[:, 1 : 1 + text_len]
+
+        # 3. Prepare Text Tokens
+        text_tokens = self.text_adapter(
+            encoder_hidden_states,
+            attention_mask=attention_mask,
+            text_rotary_emb=text_rotary_emb,
+        )
+        text_tokens = torch.cat([time_token, text_tokens], dim=1)
 
         seq_text = text_tokens.shape[1]
         text_freqs = (cos[:, :seq_text], sin[:, :seq_text])

@@ -737,6 +737,8 @@ class TransformerTextAdapter(nn.Module):
         num_attention_heads: int = 8,
         ffn_expansion_ratio: float = 4.0,
         use_checkpointing: bool = True,
+        norm_type: str = "layer_norm",
+        activation_func: str = "geglu",
     ):
         super().__init__()
         self.proj_in = nn.Linear(in_channels, hidden_size)
@@ -752,6 +754,8 @@ class TransformerTextAdapter(nn.Module):
                     disable_self_attention=False,
                     qk_norm="rms_norm",
                     ffn_expansion_ratio=ffn_expansion_ratio,
+                    norm_type=norm_type,
+                    activation_func=activation_func,
                 )
                 for _ in range(num_layers)
             ]
