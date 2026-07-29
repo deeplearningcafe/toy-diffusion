@@ -393,7 +393,7 @@ class SprintLuminaNextDit(LuminaNextDit):
         # SPRINT token dropping
         if should_drop:
             img_part_sparse, ids_keep, ids_restore = get_token_drop_indices(
-                x,
+                img_part,
                 h_patches=H // self.patch_size,
                 w_patches=W // self.patch_size,
                 drop_ratio=self.drop_ratio,
