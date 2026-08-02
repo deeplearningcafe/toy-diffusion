@@ -145,6 +145,7 @@ def get_model(config, device):
             use_rope_text_adapter=config.get("use_rope_text_adapter", False),
             norm_type=config.get("norm_type", "layer_norm"),
             activation_func=config.get("activation_func", "geglu"),
+            skip_checkpointing_layers=config.get("skip_checkpointing_layers", 0),
         ).to(device)
 
         model = (
