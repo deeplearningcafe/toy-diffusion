@@ -374,7 +374,7 @@ class DualStreamDiT(nn.Module):
         for _, module in self.named_modules():
             if isinstance(module, MMDiTAttention):
                 nn.init.zeros_(module.proj_text.weight)
-                nn.init.zeros_(module.proj_img.weight)
+                nn.init.zeros_(module.proj_image.weight)
             elif isinstance(module, SwiGLUFFN):
                 nn.init.zeros_(module.w3.weight)
 

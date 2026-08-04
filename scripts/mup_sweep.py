@@ -6,7 +6,7 @@ import matplotlib.pyplot as plt
 from torch.utils.data import DataLoader, Dataset
 from omegaconf import OmegaConf
 
-from toy_diffusion.data.image import ImageDataset
+from toy_diffusion.data.image import ImageDataset, TieredBatchSampler
 from toy_diffusion.trainer import Trainer
 
 
@@ -40,11 +40,17 @@ def register_coord_hooks(model):
 
 
 def run_sweep_step(
-    width, lr, init_std, mup_enabled, steps=1000, dataset=None, is_coord_check=False
+    width,
+    lr,
+    init_std,
+    mup_enabled,
+    steps=1000,
+    dataset=None,
+    is_coord_check=False,
 ):
     """
     Initializes the model and runs train steps via the Trainer class.
-    If is_coord_check is True, logs activation scale statistics.
+    Steps the optimizer explicitly to ensure weights update.
     """
     device = "cuda" if torch.cuda.is_available() else "cpu"
     mup_base_width = 256
@@ -64,9 +70,15 @@ def run_sweep_step(
         "batch_size": 256,
         "loss_target": "v",
         "schedule_type": "linear",
-        "is_conditional": False,
+        "is_conditional": True,
         "use_ema": False,
-        "compile_model": False,
+        "compile_model": False, #True if not is_coord_check else False,
+        "cross_attention_dim": 256,
+        "num_workers": 4,
+        "epochs": 3,
+        "is_latents": True,
+        "vae_pretrained": "kaiyuyue/FLUX.2-dev-vae",
+        "warmup": 0.001,
     }
 
     # Use dataset or construct fallback
@@ -81,13 +93,21 @@ def run_sweep_step(
 
         dataset = SyntheticDataset()
 
+    is_conditional = True
+    if config.get("is_latents"):
+        config["in_channels"] = (
+            dataset[0][0].shape[0] if is_conditional else dataset[0].shape[0]
+        )
+
+    batch_sampler = TieredBatchSampler(
+        dataset.tiers, config["batch_size"], drop_last=True
+    )
     dataloader = DataLoader(
         dataset,
-        batch_size=config["batch_size"],
-        shuffle=True,
-        num_workers=4 if torch.cuda.is_available() else 0,
-        pin_memory=torch.cuda.is_available(),
-        persistent_workers=True if torch.cuda.is_available() else False,
+        batch_sampler=batch_sampler,
+        num_workers=config["num_workers"],
+        persistent_workers=True if config["num_workers"] > 0 else False,
+        pin_memory=True,
     )
 
     trainer = Trainer(
@@ -108,7 +128,28 @@ def run_sweep_step(
         for batch in dataloader:
             if step_count >= steps:
                 break
+
             loss = trainer.train_step(batch)
+
+            if trainer.scaler:
+                if trainer.grad_clip > 0.0:
+                    trainer.scaler.unscale_(trainer.optimizer)
+                    torch.nn.utils.clip_grad_norm_(
+                        trainer.model.parameters(), trainer.grad_clip
+                    )
+                trainer.scaler.step(trainer.optimizer)
+                trainer.scaler.update()
+            else:
+                if trainer.grad_clip > 0.0:
+                    torch.nn.utils.clip_grad_norm_(
+                        trainer.model.parameters(), trainer.grad_clip
+                    )
+                trainer.optimizer.step()
+
+            trainer.optimizer.zero_grad(set_to_none=True)
+            if trainer.scheduler is not None:
+                trainer.scheduler.step()
+
             total_loss += loss.item()
             step_count += 1
 
@@ -121,32 +162,86 @@ def run_sweep_step(
 
 
 def plot_coord_check(results_data, steps):
-    """
-    Saves visual coordinate alignment plot for mup verification.
-    """
-    os.makedirs("results", exist_ok=True)
-    fig, axes = plt.subplots(1, 2, figsize=(16, 6))
+    """Saves visual coordinate alignment plot for mup verification.
 
-    for idx, (mode, data_dict) in enumerate(results_data.items()):
-        ax = axes[idx]
-        for width, layers_data in data_dict.items():
-            for layer_name, values in layers_data.items():
-                # Pick a representative layer (e.g. self-attn) to plot
-                if "attn.to_out" in layer_name:
-                    ax.plot(
-                        range(len(values)),
-                        values,
-                        label=f"W={width} ({layer_name[:15]})",
-                        alpha=0.8,
-                    )
-        ax.set_title(f"Activation Coords - {mode.upper()}", fontsize=14)
-        ax.set_xlabel("Steps", fontsize=12)
-        ax.set_ylabel("Mean Absolute Value", fontsize=12)
-        ax.grid(True, linestyle="--", alpha=0.5)
-        ax.legend()
+    Organized into 2 columns (SP, MUP) and 1 row per width dimension (e.g., 128,
+    256, 512).
+    """
+    os.makedirs("results/mup", exist_ok=True)
+
+    target_keywords = [
+        "qkv_image",
+        "w12",
+        "proj_image",
+        "w3",
+        "proj_out",
+    ]
+
+    modes = list(results_data.keys()) 
+    if not modes:
+        return
+
+    widths = sorted(
+        list(
+            {
+                w
+                for mode_data in results_data.values()
+                if mode_data
+                for w in mode_data.keys()
+            }
+        )
+    )
+
+    if not widths:
+        return
+
+    n_rows = len(widths)
+    n_cols = len(modes)
+
+    # Create subplot grid: 1 row per width, 1 column per mode
+    fig, axes = plt.subplots(
+        n_rows, n_cols, figsize=(16, 8.5 * n_rows), squeeze=False
+    )
+
+
+    for col_idx, mode in enumerate(modes):
+        data_dict = results_data.get(mode, {})
+        for row_idx, width in enumerate(widths):
+            ax = axes[row_idx, col_idx]
+            layers_data = data_dict.get(width, {})
+
+            if layers_data:
+                for layer_name, values in layers_data.items():
+                    # Plot layers matching MMDiT layer keywords
+                    if any(kw in layer_name for kw in target_keywords):
+                        short_name = layer_name.replace("unet.", "")
+                        ax.plot(
+                            range(len(values)),
+                            values,
+                            label=short_name,
+                            alpha=0.7,
+                            linewidth=1.5,
+                        )
+
+            ax.set_title(
+                f"Activation Coords - {mode.upper()} (Width {width})",
+                fontsize=12,
+            )
+            ax.set_xlabel("Steps", fontsize=10)
+            ax.set_ylabel("Mean Absolute Value", fontsize=10)
+            ax.grid(True, linestyle="--", alpha=0.5)
+
+            handles, labels = ax.get_legend_handles_labels()
+            if handles:
+                ax.legend(
+                    fontsize=7,
+                    loc="upper left",
+                    bbox_to_anchor=(1.02, 1.0),
+                )
 
     plt.tight_layout()
-    plt.savefig("results/mup_coord_check.png", dpi=150)
+    plot_path = "results/mup/mup_coord_check.png"
+    plt.savefig(plot_path, dpi=300, bbox_inches="tight")
     plt.close()
 
 
@@ -154,7 +249,7 @@ def plot_hyperparam_sweep(sweep_results):
     """
     Plots learning rate vs loss across initialization variances.
     """
-    os.makedirs("results", exist_ok=True)
+    os.makedirs("results/mup", exist_ok=True)
     fig, axes = plt.subplots(1, 2, figsize=(16, 6))
 
     for idx, (mup_status, widths_data) in enumerate(sweep_results.items()):
@@ -179,7 +274,8 @@ def plot_hyperparam_sweep(sweep_results):
         ax.legend()
 
     plt.tight_layout()
-    plt.savefig("results/mup_hyperparam_sweep.png", dpi=150)
+    plot_path = "results/mup/mup_hyperparam_sweep.png"
+    plt.savefig(plot_path, dpi=150)
     plt.close()
 
 
@@ -204,13 +300,11 @@ def main():
     )
     args = parser.parse_args()
 
-    # Load default configs
     config = {}
     if os.path.exists(args.config):
         cfg = OmegaConf.load(args.config)
         config = OmegaConf.to_container(cfg.data)
 
-    # Initialize Dataset
     dataset = None
     data_path = config.get("data_path", "")
     if os.path.exists(data_path):
@@ -226,13 +320,13 @@ def main():
     else:
         print("Data path not configured. Utilizing synthetic datasets.")
 
-    widths = [128, 256, 512]
+    widths = [256, 512]
 
     if args.coord_check:
         print("\n================================================")
         print("Starting Coordinate Check Verification Run...")
         print("================================================")
-        coord_steps = 15  # Short step count is sufficient for scale checks
+        coord_steps = 30  # Short step count is sufficient for scale checks
         results = {"sp": {}, "mup": {}}
 
         for mup in [False, True]:
@@ -251,17 +345,16 @@ def main():
                 results[mode_key][w] = act_data
 
         plot_coord_check(results, coord_steps)
-        print("\nCoordinate check finished! Plot saved to results/mup_coord_check.png")
+        print("\nCoordinate check finished! Plot saved to results/mup/mup_coord_check.png")
 
     else:
         print("\n================================================")
         print(f"Starting Hyperparameter Sweep ({args.steps} Steps)...")
         print("================================================")
 
-        lrs = [3e-4, 8e-4, 1e-3, 3e-3, 6e-3]
+        lrs = [4e-4, 8e-4, 1e-3, 4e-3, 8e-3]
         init_stds = [0.01, 0.02]
 
-        # Grid Results: {mup_enabled: {width: {init_std: {lr: loss}}}}
         sweep_results = {
             False: {w: {init: {} for init in init_stds} for w in widths},
             True: {w: {init: {} for init in init_stds} for w in widths},
@@ -283,10 +376,11 @@ def main():
                             dataset=dataset,
                             is_coord_check=False,
                         )
+                        torch.cuda.empty_cache()
                         sweep_results[mup][w][init][lr] = loss
 
         plot_hyperparam_sweep(sweep_results)
-        print("\nSweep completed! Results saved to results/mup_hyperparam_sweep.png")
+        print("\nSweep completed! Results saved to results/mup/mup_hyperparam_sweep.png")
 
 
 if __name__ == "__main__":
