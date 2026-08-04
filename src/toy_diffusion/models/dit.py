@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import math
 
 from toy_diffusion.models.layers import (
     Attention,
@@ -54,6 +55,7 @@ class LuminaNextDiTBlock(nn.Module):
         use_i1: bool = False,
         use_skip: bool = False,
         use_checkpointing: bool = True,
+        mup_enabled: bool = False,
     ):
         super().__init__()
         self.use_i1 = use_i1
@@ -75,6 +77,7 @@ class LuminaNextDiTBlock(nn.Module):
             qk_norm="rms_norm",
             eps=eps,
             base_sequence_length=base_sequence_length,
+            mup_enabled=mup_enabled,
         )
 
         self.norm2 = nn.RMSNorm(dim, eps=eps)
@@ -202,6 +205,10 @@ class LuminaNextDit(nn.Module):
         use_rope_text_adapter: bool = False,
         norm_type: str = "layer_norm",
         activation_func: str = "geglu",
+        mup_enabled: bool = False,
+        mup_base_width: int = 256,
+        mup_input_alpha: float = 1.0,
+        mup_output_alpha: float = 1.0,
     ):
         super().__init__()
         self.patch_size = patch_size
@@ -213,6 +220,13 @@ class LuminaNextDit(nn.Module):
         self.use_checkpointing = use_checkpointing
         # in the original i1 paper the don't use it
         self.use_rope_text_adapter = use_rope_text_adapter
+
+        # Set up muP scaling parameters
+        self.mup_enabled = mup_enabled
+        self.mup_base_width = mup_base_width
+        self.mup_input_alpha = mup_input_alpha
+        self.mup_output_alpha = mup_output_alpha
+        self.mup_width_multiplier = hidden_size / mup_base_width if mup_enabled else 1.0
 
         self.x_embedder = nn.Linear(
             in_features=patch_size * patch_size * in_channels,
@@ -238,6 +252,7 @@ class LuminaNextDit(nn.Module):
                 use_checkpointing=use_checkpointing,
                 norm_type=norm_type,
                 activation_func=activation_func,
+                mup_enabled=mup_enabled,
             )
             self.image_refiner = nn.ModuleList(
                 [
@@ -249,6 +264,7 @@ class LuminaNextDit(nn.Module):
                         base_sequence_length=None,
                         use_i1=True,
                         use_checkpointing=use_checkpointing,
+                        mup_enabled=mup_enabled,
                     )
                     for _ in range(2)
                 ]
@@ -272,6 +288,7 @@ class LuminaNextDit(nn.Module):
                         base_sequence_length=None,
                         use_i1=use_i1,
                         use_checkpointing=use_checkpointing,
+                        mup_enabled=mup_enabled,
                     )
                     for _ in range(num_in)
                 ]
@@ -296,6 +313,7 @@ class LuminaNextDit(nn.Module):
                         use_i1=use_i1,
                         use_skip=True,
                         use_checkpointing=use_checkpointing,
+                        mup_enabled=mup_enabled,
                     )
                     for _ in range(num_in)
                 ]
@@ -311,6 +329,7 @@ class LuminaNextDit(nn.Module):
                         base_sequence_length=base_sequence_length,
                         use_i1=use_i1,
                         use_checkpointing=use_checkpointing,
+                        mup_enabled=mup_enabled,
                     )
                     for _ in range(depth)
                 ]
@@ -322,8 +341,46 @@ class LuminaNextDit(nn.Module):
         self._zero_initialize_output()
 
     def _zero_initialize_output(self):
+        """Crucial for diffusion/flow matching: start by predicting zero velocity/noise."""
         nn.init.zeros_(self.proj_out.weight)
         nn.init.zeros_(self.proj_out.bias)
+        # Zero projections
+        for _, module in self.named_modules():
+            if isinstance(module, Attention):
+                nn.init.zeros_(module.to_out.weight)
+            elif isinstance(module, Feedforward):
+                nn.init.zeros_(module.proj_out.weight)
+
+    def mup_initialize(self, init_std: float = 0.02):
+        """
+        Initializes weights according to Maximal Update Parameterization (mup).
+        """
+        if not self.mup_enabled:
+            return
+
+        std_hidden = init_std / math.sqrt(self.mup_width_multiplier)
+
+        # 1. Initialize input embedder with baseline std
+        nn.init.normal_(self.x_embedder.weight, std=init_std)
+        if self.x_embedder.bias is not None:
+            nn.init.zeros_(self.x_embedder.bias)
+
+        # 2. Initialize hidden blocks
+        for name, module in self.named_modules():
+            if module is self:
+                continue
+            if "x_embedder" in name or "proj_out" in name:
+                continue
+
+            if isinstance(module, (nn.Linear, nn.Conv2d)):
+                nn.init.normal_(module.weight, std=std_hidden)
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
+            elif isinstance(module, (nn.Embedding,)):
+                nn.init.normal_(module.weight, std=std_hidden)
+
+        # 3. Output layer remains at zero
+        self._zero_initialize_output()
 
     def patchify(self, x):
         B, C, H, W = x.shape
@@ -387,6 +444,9 @@ class LuminaNextDit(nn.Module):
 
         x_patches, (H, W) = self.patchify(x)
         img_tokens = self.x_embedder(x_patches)
+
+        if self.mup_enabled:
+            img_tokens = img_tokens * self.mup_input_alpha
 
         t_emb = self.time_embedding(t, x)
 
@@ -486,9 +546,7 @@ class LuminaNextDit(nn.Module):
                         dtype=torch.bool,
                         device=x.device,
                     )
-                    full_mask = torch.cat(
-                        [attention_mask.bool(), img_mask], dim=1
-                    )
+                    full_mask = torch.cat([attention_mask.bool(), img_mask], dim=1)
                 else:
                     full_mask = None
             else:
@@ -537,6 +595,12 @@ class LuminaNextDit(nn.Module):
 
         hidden_states = self.norm_out(hidden_states)
         hidden_states = self.proj_out(hidden_states)
+
+        if self.mup_enabled:
+            hidden_states = hidden_states * (
+                self.mup_output_alpha / self.mup_width_multiplier
+            )
+
         x = self.unpatchify(hidden_states, H, W)
 
         return x

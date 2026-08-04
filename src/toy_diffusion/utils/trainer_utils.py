@@ -146,7 +146,15 @@ def get_model(config, device):
             norm_type=config.get("norm_type", "layer_norm"),
             activation_func=config.get("activation_func", "geglu"),
             skip_checkpointing_layers=config.get("skip_checkpointing_layers", 0),
+            mup_enabled=config.get("mup_enabled", False),
+            mup_base_width=config.get("mup_base_width", 256),
+            mup_input_alpha=config.get("mup_input_alpha", 1.0),
+            mup_output_alpha=config.get("mup_output_alpha", 1.0),
         ).to(device)
+
+        # Apply modular muP initialization
+        if config.get("mup_enabled", False) and hasattr(unet, "mup_initialize"):
+            unet.mup_initialize(init_std=config.get("init_std", 0.02))
 
         model = (
             nn.ModuleDict({"unet": unet, "text_enc": text_enc})
@@ -169,7 +177,14 @@ def get_model(config, device):
             use_rope_text_adapter=config.get("use_rope_text_adapter", False),
             norm_type=config.get("norm_type", "layer_norm"),
             activation_func=config.get("activation_func", "geglu"),
+            mup_enabled=config.get("mup_enabled", False),
+            mup_base_width=config.get("mup_base_width", 256),
+            mup_input_alpha=config.get("mup_input_alpha", 1.0),
+            mup_output_alpha=config.get("mup_output_alpha", 1.0),
         ).to(device)
+
+        if config.get("mup_enabled", False) and hasattr(unet, "mup_initialize"):
+            unet.mup_initialize(init_std=config.get("init_std", 0.02))
 
         model = (
             nn.ModuleDict({"unet": unet, "text_enc": text_enc})
@@ -345,6 +360,95 @@ def create_optimizer_param_groups(
     return param_groups
 
 
+def create_mup_optimizer_param_groups(model, lr, weight_decay, mup_width_multiplier):
+    """
+    Separates base layers from hidden block layers for correct muP scaling.
+    Base layers (I/O) retain standard constant learning rate.
+    Hidden block layers scale learning rate as lr / mup_width_multiplier.
+    """
+    param_groups = []
+    no_decay_keywords = ["bias", "norm"]
+
+    # These projection and embedding layers do not get their learning rate scaled
+    base_keywords = [
+        "x_embedder",
+        "time_embedding",
+        "cap_embedder",
+        "proj_in",
+        "proj_out",
+        "embedding",
+        "pos_embedding",
+    ]
+
+    hidden_decay = []
+    hidden_nodecay = []
+    base_decay = []
+    base_nodecay = []
+
+    for name, param in model.named_parameters():
+        if not param.requires_grad:
+            continue
+
+        clean_name = name
+        if clean_name.startswith("_orig_mod."):
+            clean_name = clean_name[len("_orig_mod.") :]
+
+        is_base = any(kw in clean_name for kw in base_keywords)
+        is_nodecay = any(kw in clean_name for kw in no_decay_keywords)
+
+        if is_base:
+            if is_nodecay:
+                base_nodecay.append(param)
+            else:
+                base_decay.append(param)
+        else:
+            if is_nodecay:
+                hidden_nodecay.append(param)
+            else:
+                hidden_decay.append(param)
+
+    lr_hidden = lr / mup_width_multiplier
+
+    if hidden_decay:
+        param_groups.append(
+            {
+                "params": hidden_decay,
+                "lr": lr_hidden,
+                "weight_decay": weight_decay,
+                "name": "hidden_decay",
+            }
+        )
+    if hidden_nodecay:
+        param_groups.append(
+            {
+                "params": hidden_nodecay,
+                "lr": lr_hidden,
+                "weight_decay": 0.0,
+                "name": "hidden_nodecay",
+            }
+        )
+    if base_decay:
+        param_groups.append(
+            {
+                "params": base_decay,
+                "lr": lr,
+                "weight_decay": weight_decay,
+                "name": "base_decay",
+            }
+        )
+    if base_nodecay:
+        param_groups.append(
+            {
+                "params": base_nodecay,
+                "lr": lr,
+                "weight_decay": 0.0,
+                "name": "base_nodecay",
+            }
+        )
+
+    return param_groups
+
+
 def create_optim_scheduler(model, len_train_loader: int, conf: omegaconf.DictConfig):
     if conf.get("model_type") == "ddgan":
         optimizer_g = torch.optim.Adam(
@@ -355,9 +459,21 @@ def create_optim_scheduler(model, len_train_loader: int, conf: omegaconf.DictCon
         )
         return {"G": optimizer_g, "D": optimizer_d}, None
 
-    param_groups = create_optimizer_param_groups(
-        model, conf["lr"], conf.get("wd", 0.01)
-    )
+    if conf.get("mup_enabled", False):
+        hidden_dim = conf["hidden_dim"]
+        mup_base_width = conf.get("mup_base_width", 256)
+        mup_width_multiplier = hidden_dim / mup_base_width
+        print(f"Creating muP optimizer (width multiplier: {mup_width_multiplier})")
+        param_groups = create_mup_optimizer_param_groups(
+            model,
+            conf["lr"],
+            conf.get("wd", 0.01),
+            mup_width_multiplier,
+        )
+    else:
+        param_groups = create_optimizer_param_groups(
+            model, conf["lr"], conf.get("wd", 0.01)
+        )
     if conf.get("use_bitsandbytes", False):
         import bitsandbytes as bnb
 

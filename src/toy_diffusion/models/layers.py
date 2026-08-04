@@ -379,11 +379,13 @@ class Attention(nn.Module):
         eps: float = 1e-5,
         base_sequence_length: int = None,
         use_flash_attention=HAS_FLASH_ATTENTION,
+        mup_enabled: bool = False,
     ):
         super().__init__()
         self.in_channels = in_channels
         self.cross_attention_dim = in_channels
         self.num_attention_heads = num_attention_heads
+        self.mup_enabled = mup_enabled
         if cross_attention_dim:
             self.cross_attention_dim = cross_attention_dim
 
@@ -440,7 +442,7 @@ class Attention(nn.Module):
         self, x, encoder_hidden_states=None, attention_mask=None, image_rotary_emb=None
     ):
         batch, T, C = x.shape
-        
+
         # Dynamic QKV/KV linear fusion
         if encoder_hidden_states is None or encoder_hidden_states is x:
             if self.cross_attention_dim == self.in_channels:
@@ -498,11 +500,15 @@ class Attention(nn.Module):
             k = k.repeat_interleave(n_rep, dim=1)
             v = v.repeat_interleave(n_rep, dim=1)
 
-        softmax_scale = self.scale
-        if self.base_sequence_length is not None:
-            softmax_scale = (
-                math.sqrt(math.log(T, self.base_sequence_length)) * self.scale
-            )
+        # Apply muP scaling (1/d_head) instead of standard 1/sqrt(d_head)
+        if self.mup_enabled:
+            softmax_scale = 1.0 / self.head_dim
+        else:
+            softmax_scale = self.scale
+            if self.base_sequence_length is not None:
+                softmax_scale = (
+                    math.sqrt(math.log(T, self.base_sequence_length)) * self.scale
+                )
 
         x = torch.nn.functional.scaled_dot_product_attention(
             q, k, v, attn_mask=sdpa_mask, is_causal=False, scale=softmax_scale
@@ -555,11 +561,14 @@ class Attention(nn.Module):
             q = apply_rotary_emb(q, image_rotary_emb)
             k = apply_rotary_emb(k, image_rotary_emb)
 
-        softmax_scale = self.scale
-        if self.base_sequence_length is not None:
-            softmax_scale = (
-                math.sqrt(math.log(T, self.base_sequence_length)) * self.scale
-            )
+        if self.mup_enabled:
+            softmax_scale = 1.0 / self.head_dim
+        else:
+            softmax_scale = self.scale
+            if self.base_sequence_length is not None:
+                softmax_scale = (
+                    math.sqrt(math.log(T, self.base_sequence_length)) * self.scale
+                )
 
         x = flash_attn_func(q, k, v, causal=False, softmax_scale=softmax_scale)
 
@@ -588,10 +597,12 @@ class GEGLU(nn.Module):
         hidden_states, gate = self.proj_in(x).chunk(2, dim=-1)
         return hidden_states * torch.nn.functional.gelu(gate)
 
+
 class SwiGLU(nn.Module):
     """
     Swish Gated Linear Unit (SwiGLU) activation module.
     """
+
     def __init__(self, in_channels, out_channels, bias=True) -> None:
         super().__init__()
         self.in_channels = in_channels
@@ -607,20 +618,19 @@ class SwiGLU(nn.Module):
         hidden_states, gate = self.proj_in(x).chunk(2, dim=-1)
         return hidden_states * torch.nn.functional.silu(gate)
 
+
 class Feedforward(nn.Module):
-    def __init__(self, in_channels, expansion_ratio=4, activation_func: str = "geglu") -> None:
+    def __init__(
+        self, in_channels, expansion_ratio=4, activation_func: str = "geglu"
+    ) -> None:
         super().__init__()
         self.in_channels = in_channels
         hidden_channels = int(in_channels * expansion_ratio)
 
         if activation_func == "geglu":
-            self.geglu = GEGLU(
-                self.in_channels, hidden_channels, bias=True
-            )
+            self.geglu = GEGLU(self.in_channels, hidden_channels, bias=True)
         elif activation_func == "swiglu":
-            self.geglu = SwiGLU(
-                self.in_channels, hidden_channels, bias=True
-            )
+            self.geglu = SwiGLU(self.in_channels, hidden_channels, bias=True)
         else:
             raise ValueError(f"Unknown activation: {activation_func}")
 
@@ -648,6 +658,7 @@ class TransformerBlock(nn.Module):
         ffn_expansion_ratio: int = 4,
         norm_type: str = "layer_norm",
         activation_func: str = "geglu",
+        mup_enabled: bool = False,
     ):
         super().__init__()
         self.in_channels = in_channels
@@ -672,6 +683,7 @@ class TransformerBlock(nn.Module):
                 num_attention_heads=self.num_attention_heads,
                 qk_norm=qk_norm,
                 kv_num_heads=kv_num_heads,
+                mup_enabled=mup_enabled,
             )
 
         # cross attn
@@ -683,6 +695,7 @@ class TransformerBlock(nn.Module):
                 cross_attention_dim=self.cross_attention_dim,
                 qk_norm=qk_norm,
                 kv_num_heads=kv_num_heads,
+                mup_enabled=mup_enabled,
             )
 
         # feed forward
@@ -739,6 +752,7 @@ class TransformerTextAdapter(nn.Module):
         use_checkpointing: bool = True,
         norm_type: str = "layer_norm",
         activation_func: str = "geglu",
+        mup_enabled: bool = False,
     ):
         super().__init__()
         self.proj_in = nn.Linear(in_channels, hidden_size)
@@ -756,6 +770,7 @@ class TransformerTextAdapter(nn.Module):
                     ffn_expansion_ratio=ffn_expansion_ratio,
                     norm_type=norm_type,
                     activation_func=activation_func,
+                    mup_enabled=mup_enabled,
                 )
                 for _ in range(num_layers)
             ]
