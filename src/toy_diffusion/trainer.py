@@ -94,10 +94,20 @@ class Trainer:
             config, self.model, prediction_target, self.device
         )
 
+        batch_size = config.get("batch_size", 64)
+        len_train_loader = int(
+            np.ceil(
+                len(dataset)
+                / batch_size
+                / self.gradient_accumulation_steps
+            )
+        )
+
         self.optimizer, self.scheduler = create_optim_scheduler(
             self.model,
-            len_train_loader=len(dataset) / config.get("batch_size", 64),
+            len_train_loader=len_train_loader,
             conf=config,
+            start_epoch=0,
         )
         self.grad_offloader = None
         if self.gradient_accumulation_steps > 1:
@@ -127,14 +137,37 @@ class Trainer:
         self.start_epoch = 0
         resume_dir = config.get("resume_from_checkpoint", None)
         if resume_dir is not None:
+            ignore_scheduler = self.config.get(
+                "ignore_checkpoint_scheduler", False
+            )
             self.start_epoch, ckpt_cfg, ckpt_vocab = load_from_checkpoint(
                 checkpoint_dir=resume_dir,
                 model=self.model,
                 optimizer=self.optimizer,
-                scheduler=self.scheduler,
+                scheduler=None if ignore_scheduler else self.scheduler,
                 ema=self.ema,
                 skip_text_enc=True if config.get("hf_text_encoder", None) else False,
             )
+            if ignore_scheduler:
+                skip_warmup = self.config.get("skip_warmup", False)
+                # TODO: clear memory, decuple optimizer from scheduler
+                self.optimizer, self.scheduler = create_optim_scheduler(
+                    self.model,
+                    len_train_loader=len_train_loader,
+                    conf=self.config,
+                    skip_warmup=skip_warmup,
+                    start_epoch=self.start_epoch,
+                )
+                # Re-load the optimizer state for the newly created optimizer
+                _ = load_from_checkpoint(
+                    checkpoint_dir=resume_dir,
+                    model=self.model,
+                    optimizer=self.optimizer,
+                    scheduler=None,
+                    ema=self.ema,
+                    skip_text_enc=True if config.get("hf_text_encoder", None) else False,
+                )
+                torch.cuda.empty_cache()
             if ckpt_vocab and "vocab" not in self.config:
                 self.config["vocab"] = ckpt_vocab
 

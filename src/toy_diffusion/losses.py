@@ -281,9 +281,12 @@ class GeneralDiffusionLoss(nn.Module):
             # shifting the target we get uncond contrastive loss
             cfm_target = torch.roll(target, shifts=1, dims=0)
             # - as we want this loss to be big st diff conds produce diff preds
-            loss -= 0.05 * torch.nn.functional.mse_loss(
-                pred.to(torch.float32), cfm_target.to(torch.float32), reduction="none"
+            contrast_loss = torch.nn.functional.mse_loss(
+                pred.to(torch.float32),
+                cfm_target.to(torch.float32),
+                reduction="none",
             )
+            loss = loss - 0.05 * contrast_loss
 
         # Sum over batch
         return torch.sum(loss) / B

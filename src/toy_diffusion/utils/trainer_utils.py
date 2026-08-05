@@ -345,7 +345,13 @@ def create_optimizer_param_groups(
     return param_groups
 
 
-def create_optim_scheduler(model, len_train_loader: int, conf: omegaconf.DictConfig):
+def create_optim_scheduler(
+    model,
+    len_train_loader: int,
+    conf: omegaconf.DictConfig,
+    start_epoch: int = 0,
+    skip_warmup: bool = False,
+):
     if conf.get("model_type") == "ddgan":
         optimizer_g = torch.optim.Adam(
             model["G"].parameters(), lr=conf.get("lr", 1e-4), betas=(0.5, 0.9)
@@ -374,22 +380,26 @@ def create_optim_scheduler(model, len_train_loader: int, conf: omegaconf.DictCon
         )
 
     scheduler = None
-    total_steps = conf["epochs"] * len_train_loader
+    # if decay phase of wsd we need to change the steps
+    total_steps = (conf["epochs"]-start_epoch) * len_train_loader
     warmup_steps = int(conf.get("warmup", 0.02) * total_steps)
+    warmup_steps = 0 if skip_warmup else warmup_steps
     warmup_steps = min(warmup_steps, total_steps - 1) if total_steps > 0 else 0
 
-    scheduler_warmup = torch.optim.lr_scheduler.LinearLR(
-        optimizer,
-        start_factor=0.001,
-        end_factor=1.0,
-        total_iters=max(1, warmup_steps),
-    )
+    if warmup_steps > 0:
+        scheduler_warmup = torch.optim.lr_scheduler.LinearLR(
+            optimizer,
+            start_factor=0.001,
+            end_factor=1.0,
+            total_iters=max(1, warmup_steps),
+        )
 
     if conf.get("use_cos_scheduler", False):
         print("Using cosine lr scheduler")
         cosine_steps = max(1, total_steps - warmup_steps)
+        eta_min = conf["lr"] * conf.get("final_lr_frac", 0.05)
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-            optimizer, T_max=cosine_steps, eta_min=conf["lr"] * 0.1
+            optimizer, T_max=cosine_steps, eta_min=eta_min
         )
     else:
         print("Using constant lr scheduler")
