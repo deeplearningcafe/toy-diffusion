@@ -216,6 +216,7 @@ def get_model(config, device):
                 cfg_mask_prob=config.get("cfg_mask_prob", 0.1),
                 norm_type=config.get("norm_type", "layer_norm"),
                 activation_func=config.get("activation_func", "geglu"),
+                skip_checkpointing_layers=config.get("skip_checkpointing_layers", 0),
             ).to(device)
 
         model = (

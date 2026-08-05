@@ -255,7 +255,11 @@ class DualStreamDiT(nn.Module):
         self.skip_checkpointing_layers = skip_checkpointing_layers
         # in the original i1 paper the don't use it
         self.use_rope_text_adapter = use_rope_text_adapter
-        to_skip_count = self.skip_checkpointing_layers
+        
+        def should_checkpoint(layer_idx: int) -> bool:
+            return self.use_checkpointing and (layer_idx >= self.skip_checkpointing_layers)
+
+        current_layer_idx = 0
 
         # 1. Image Embedder
         self.x_embedder = nn.Conv2d(
@@ -269,17 +273,18 @@ class DualStreamDiT(nn.Module):
         )
 
         # 3. Transformer Text Adapter
+        text_adapter_layers = 2
         self.text_adapter = TransformerTextAdapter(
             in_channels=text_embed_dim,
             hidden_size=hidden_size,
-            num_layers=2,
+            num_layers=text_adapter_layers,
             num_attention_heads=num_heads,
             ffn_expansion_ratio=mlp_ratio,
-            use_checkpointing= False if to_skip_count > 0 else self.use_checkpointing,
+            use_checkpointing=should_checkpoint(current_layer_idx),
             norm_type=norm_type,
             activation_func=activation_func,
         )
-        to_skip_count -= 2
+        current_layer_idx += text_adapter_layers
 
         # 4. 3D RoPE
         head_dim = hidden_size // num_heads
@@ -288,6 +293,7 @@ class DualStreamDiT(nn.Module):
 
         # 5. Dual Stream Blocks (with Long Skip Connections)
         num_in_blocks = depth // 2
+        in_start_idx = current_layer_idx
         self.in_blocks = nn.ModuleList(
             [
                 DualStreamDiTBlock(
@@ -295,22 +301,23 @@ class DualStreamDiT(nn.Module):
                     num_heads,
                     mlp_ratio,
                     eps=eps,
-                    use_checkpointing=False if (to_skip_count - i / i) > 0 else self.use_checkpointing,
+                    use_checkpointing=should_checkpoint(in_start_idx + i),
                 )
-                for i in range(1, num_in_blocks + 1)
+                for i in range(num_in_blocks)
             ]
         )
-        to_skip_count -= num_in_blocks
+        current_layer_idx += num_in_blocks
 
         self.mid_block = DualStreamDiTBlock(
             hidden_size,
             num_heads,
             mlp_ratio,
             eps=eps,
-            use_checkpointing=False if to_skip_count > 0 else self.use_checkpointing,
+            use_checkpointing=should_checkpoint(current_layer_idx),
         )
-        to_skip_count -= 1
+        current_layer_idx += 1
 
+        out_start_idx = current_layer_idx
         self.out_blocks = nn.ModuleList(
             [
                 DualStreamDiTBlock(
@@ -319,11 +326,12 @@ class DualStreamDiT(nn.Module):
                     mlp_ratio,
                     eps=eps,
                     use_skip=True,
-                    use_checkpointing=False if (to_skip_count - i / i) > 0 else self.use_checkpointing,
+                    use_checkpointing=should_checkpoint(out_start_idx + i),
                 )
                 for i in range(1, num_in_blocks + 1)
             ]
         )
+        current_layer_idx += num_in_blocks
 
         self.norm_final = nn.RMSNorm(hidden_size, eps=eps)
         self.proj_out = nn.Linear(hidden_size, patch_size * patch_size * out_channels)

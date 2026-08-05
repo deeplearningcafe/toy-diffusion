@@ -93,7 +93,10 @@ class HFTextEncoder(nn.Module):
 
         # Load model in bfloat16 to save memory
         self.model = AutoModel.from_pretrained(
-            model_id, torch_dtype=torch.bfloat16
+            model_id,
+            torch_dtype=torch.bfloat16,
+            attn_implementation="sdpa",
+            trust_remote_code=True,
         )
         self.model.eval()
         self.model.requires_grad_(False)

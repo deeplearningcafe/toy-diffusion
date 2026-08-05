@@ -521,6 +521,7 @@ class SprintDualStreamDiT(DualStreamDiT):
         use_rope_text_adapter: bool = False,
         norm_type: str = "layer_norm",
         activation_func: str = "geglu",
+        skip_checkpointing_layers: int = 0,
     ):
         # Prevent base constructor block initialization
         nn.Module.__init__(self)
@@ -538,6 +539,12 @@ class SprintDualStreamDiT(DualStreamDiT):
         self.residual_type = residual_type
         self.cfg_mask_prob = cfg_mask_prob
         self.use_rope_text_adapter = use_rope_text_adapter
+        self.skip_checkpointing_layers = skip_checkpointing_layers
+        
+        def should_checkpoint(layer_idx: int) -> bool:
+            return self.use_checkpointing and (layer_idx >= self.skip_checkpointing_layers)
+
+        current_layer_idx = 0
 
         # 1. Image Embedder
         self.x_embedder = nn.Conv2d(
@@ -551,16 +558,18 @@ class SprintDualStreamDiT(DualStreamDiT):
         )
 
         # 3. Transformer Text Adapter
+        text_adapter_layers = 2
         self.text_adapter = TransformerTextAdapter(
             in_channels=text_embed_dim,
             hidden_size=hidden_size,
-            num_layers=2,
+            num_layers=text_adapter_layers,
             num_attention_heads=num_heads,
             ffn_expansion_ratio=mlp_ratio,
-            use_checkpointing=self.use_checkpointing,
+            use_checkpointing=should_checkpoint(current_layer_idx),
             norm_type=norm_type,
             activation_func=activation_func,
         )
+        current_layer_idx += text_adapter_layers
 
         # 4. 3D RoPE
         head_dim = hidden_size // num_heads
@@ -568,6 +577,7 @@ class SprintDualStreamDiT(DualStreamDiT):
         self.rope_embedder = MultimodalRopeEmbedder(axes_dims)
 
         # Encoder blocks
+        in_start_idx = current_layer_idx
         self.in_blocks = nn.ModuleList(
             [
                 DualStreamDiTBlock(
@@ -575,14 +585,16 @@ class SprintDualStreamDiT(DualStreamDiT):
                     num_heads,
                     mlp_ratio,
                     eps=eps,
-                    use_checkpointing=self.use_checkpointing,
+                    use_checkpointing=should_checkpoint(in_start_idx + i),
                 )
-                for _ in range(self.encoder_depth)
+                for i in range(self.encoder_depth)
             ]
         )
+        current_layer_idx += self.encoder_depth
 
         # Middle blocks
         # long_skip dual stream has a mid block so layers+1
+        mid_start_idx = current_layer_idx
         self.mid_blocks = nn.ModuleList(
             [
                 DualStreamDiTBlock(
@@ -590,13 +602,16 @@ class SprintDualStreamDiT(DualStreamDiT):
                     num_heads,
                     mlp_ratio,
                     eps=eps,
-                    use_checkpointing=self.use_checkpointing,
+                    use_checkpointing=should_checkpoint(mid_start_idx + i),
                 )
-                for _ in range(self.middle_depth)
+                for i in range(self.middle_depth)
             ]
         )
+        current_layer_idx += self.middle_depth
+
 
         # Decoder blocks
+        out_start_idx = current_layer_idx
         self.out_blocks = nn.ModuleList(
             [
                 DualStreamDiTBlock(
@@ -605,11 +620,12 @@ class SprintDualStreamDiT(DualStreamDiT):
                     mlp_ratio,
                     eps=eps,
                     use_skip=True,
-                    use_checkpointing=self.use_checkpointing,
+                    use_checkpointing=should_checkpoint(out_start_idx + i),
                 )
-                for _ in range(self.decoder_depth)
+                for i in range(self.decoder_depth)
             ]
         )
+        current_layer_idx += self.decoder_depth
 
         self.norm_final = nn.RMSNorm(hidden_size, eps=eps)
         self.proj_out = nn.Linear(hidden_size, patch_size * patch_size * out_channels)
