@@ -3,6 +3,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import math
+from liger_kernel.transformers import LigerRMSNorm, LigerLayerNorm
+from liger_kernel.ops import LigerSiLUMulFunction, LigerGELUMulFunction
 
 HAS_FLASH_ATTENTION = False
 try:
@@ -420,16 +422,8 @@ class Attention(nn.Module):
         self.norm_q = None
         self.norm_k = None
         if qk_norm == "rms_norm":
-            self.norm_q = nn.RMSNorm(
-                self.head_dim,
-                eps=eps,
-                elementwise_affine=True,
-            )
-            self.norm_k = nn.RMSNorm(
-                self.head_dim,
-                eps=eps,
-                elementwise_affine=True,
-            )
+            self.norm_q = LigerRMSNorm(self.head_dim, eps=eps)
+            self.norm_k = LigerRMSNorm(self.head_dim, eps=eps)
 
         if self.use_flash_attention:
             self.forward = self.forward_flash_attention
@@ -440,7 +434,7 @@ class Attention(nn.Module):
         self, x, encoder_hidden_states=None, attention_mask=None, image_rotary_emb=None
     ):
         batch, T, C = x.shape
-        
+
         # Dynamic QKV/KV linear fusion
         if encoder_hidden_states is None or encoder_hidden_states is x:
             if self.cross_attention_dim == self.in_channels:
@@ -586,12 +580,14 @@ class GEGLU(nn.Module):
 
     def forward(self, x):
         hidden_states, gate = self.proj_in(x).chunk(2, dim=-1)
-        return hidden_states * torch.nn.functional.gelu(gate)
+        return LigerGELUMulFunction.apply(gate, hidden_states)
+
 
 class SwiGLU(nn.Module):
     """
     Swish Gated Linear Unit (SwiGLU) activation module.
     """
+
     def __init__(self, in_channels, out_channels, bias=True) -> None:
         super().__init__()
         self.in_channels = in_channels
@@ -605,22 +601,21 @@ class SwiGLU(nn.Module):
 
     def forward(self, x):
         hidden_states, gate = self.proj_in(x).chunk(2, dim=-1)
-        return hidden_states * torch.nn.functional.silu(gate)
+        return LigerSiLUMulFunction.apply(gate, hidden_states)
+
 
 class Feedforward(nn.Module):
-    def __init__(self, in_channels, expansion_ratio=4, activation_func: str = "geglu") -> None:
+    def __init__(
+        self, in_channels, expansion_ratio=4, activation_func: str = "geglu"
+    ) -> None:
         super().__init__()
         self.in_channels = in_channels
         hidden_channels = int(in_channels * expansion_ratio)
 
         if activation_func == "geglu":
-            self.geglu = GEGLU(
-                self.in_channels, hidden_channels, bias=True
-            )
+            self.geglu = GEGLU(self.in_channels, hidden_channels, bias=True)
         elif activation_func == "swiglu":
-            self.geglu = SwiGLU(
-                self.in_channels, hidden_channels, bias=True
-            )
+            self.geglu = SwiGLU(self.in_channels, hidden_channels, bias=True)
         else:
             raise ValueError(f"Unknown activation: {activation_func}")
 
@@ -658,9 +653,9 @@ class TransformerBlock(nn.Module):
 
         def get_norm(dim):
             if norm_type == "layer_norm":
-                return nn.LayerNorm(dim)
+                return LigerLayerNorm(dim)
             elif norm_type == "rms_norm":
-                return nn.RMSNorm(dim)
+                return LigerRMSNorm(dim)
             else:
                 raise ValueError(f"Unknown norm_type: {norm_type}")
 

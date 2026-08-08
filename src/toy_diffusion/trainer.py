@@ -71,6 +71,8 @@ class Trainer:
         self.gradient_accumulation_steps = self.config.get(
             "gradient_accumulation_steps", 1
         )
+        # Default to False (VRAM gradient accumulation for small models <1B params)
+        self.use_cpu_accumulator = self.config.get("use_cpu_accumulator", False)
 
         self.vae = None
         if self.is_latents and self.vae is None:
@@ -96,11 +98,7 @@ class Trainer:
 
         batch_size = config.get("batch_size", 64)
         len_train_loader = int(
-            np.ceil(
-                len(dataset)
-                / batch_size
-                / self.gradient_accumulation_steps
-            )
+            np.ceil(len(dataset) / batch_size / self.gradient_accumulation_steps)
         )
 
         self.optimizer, self.scheduler = create_optim_scheduler(
@@ -110,7 +108,7 @@ class Trainer:
             start_epoch=0,
         )
         self.grad_offloader = None
-        if self.gradient_accumulation_steps > 1:
+        if self.use_cpu_accumulator and self.gradient_accumulation_steps > 1:
             target_model = (
                 self.model["unet"]
                 if (
@@ -166,7 +164,9 @@ class Trainer:
                     optimizer=self.optimizer,
                     scheduler=None,
                     ema=self.ema,
-                    skip_text_enc=True if config.get("hf_text_encoder", None) else False,
+                    skip_text_enc=True
+                    if config.get("hf_text_encoder", None)
+                    else False,
                 )
                 torch.cuda.empty_cache()
             if ckpt_vocab and "vocab" not in self.config:
@@ -257,7 +257,6 @@ class Trainer:
                 self.scaler.scale(scaled_loss).backward()
             else:
                 scaled_loss.backward()
-            del scaled_loss
 
             return loss
 
@@ -345,7 +344,7 @@ class Trainer:
 
             loss = self.train_epoch(dataloader)
 
-            if (epoch + 1) % log_interval == 0 or (epoch+1) == epochs:
+            if (epoch + 1) % log_interval == 0 or (epoch + 1) == epochs:
                 if isinstance(self.optimizer, dict):
                     lr_val = self.optimizer["G"].param_groups[0]["lr"]
                 else:
@@ -355,10 +354,14 @@ class Trainer:
                     f"[Epoch {epoch + 1}/{epochs}] Loss: {loss:.6f} LR: {lr_val:.3e}"
                 )
 
-            if (epoch + 1) % sample_interval == 0 or (epoch+1) == epochs:
+            if (epoch + 1) % sample_interval == 0 or (epoch + 1) == epochs:
                 self.run_sampling(timestamp, epoch, num_steps)
 
-            if save_interval > 0 and (epoch + 1) % save_interval == 0 or (epoch+1) == epochs:
+            if (
+                save_interval > 0
+                and (epoch + 1) % save_interval == 0
+                or (epoch + 1) == epochs
+            ):
                 vocab = getattr(self.dataset, "vocab", None)
                 if vocab is None:
                     vocab = self.config.get("vocab", None)
@@ -372,7 +375,9 @@ class Trainer:
                     ema=self.ema,
                     config=self.config,
                     vocab=vocab,
-                    skip_text_enc=True if self.config.get("hf_text_encoder", None) else False,
+                    skip_text_enc=True
+                    if self.config.get("hf_text_encoder", None)
+                    else False,
                 )
 
         return self.model
