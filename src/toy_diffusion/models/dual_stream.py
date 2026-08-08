@@ -2,6 +2,8 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from liger_kernel.transformers import LigerRMSNorm
+from liger_kernel.ops import LigerSiLUMulFunction
 
 from toy_diffusion.models.layers import (
     TimeEmbeddings,
@@ -26,7 +28,6 @@ def _apply_multimodal_rope(
     x0 = x_pair[..., 0]
     x1 = x_pair[..., 1]
 
-
     # cos, sin shape: [B, SeqLen, HeadDim // 2] -> [B, SeqLen, 1, HeadDim // 2]
     cos = cos.unsqueeze(2).float()
     sin = sin.unsqueeze(2).float()
@@ -37,7 +38,6 @@ def _apply_multimodal_rope(
     return out.view(sh).to(dtype)
 
 
-
 class SwiGLUFFN(nn.Module):
     def __init__(self, hidden_size: int, hidden_features: int) -> None:
         super().__init__()
@@ -46,7 +46,7 @@ class SwiGLUFFN(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x1, x2 = self.w12(x).chunk(2, dim=-1)
-        return self.w3(F.silu(x1) * x2)
+        return self.w3(LigerSiLUMulFunction.apply(x1, x2))
 
 
 class MMDiTAttention(nn.Module):
@@ -59,8 +59,8 @@ class MMDiTAttention(nn.Module):
         self.qkv_image = nn.Linear(hidden_size, 3 * hidden_size)
         self.qkv_text = nn.Linear(hidden_size, 3 * hidden_size)
 
-        self.q_norm = nn.RMSNorm(self.head_dim, eps=eps)
-        self.k_norm = nn.RMSNorm(self.head_dim, eps=eps)
+        self.q_norm = LigerRMSNorm(self.head_dim, eps=eps)
+        self.k_norm = LigerRMSNorm(self.head_dim, eps=eps)
 
         self.proj_image = nn.Linear(hidden_size, hidden_size)
         self.proj_text = nn.Linear(hidden_size, hidden_size)
@@ -133,10 +133,10 @@ class DualStreamDiTBlock(nn.Module):
             self.skip_linear_text = nn.Linear(2 * hidden_size, hidden_size)
 
         # Sandwich Norm
-        self.norm1 = nn.RMSNorm(hidden_size, eps=eps)
-        self.norm2 = nn.RMSNorm(hidden_size, eps=eps)
-        self.norm3 = nn.RMSNorm(hidden_size, eps=eps)
-        self.norm4 = nn.RMSNorm(hidden_size, eps=eps)
+        self.norm1 = LigerRMSNorm(hidden_size, eps=eps)
+        self.norm2 = LigerRMSNorm(hidden_size, eps=eps)
+        self.norm3 = LigerRMSNorm(hidden_size, eps=eps)
+        self.norm4 = LigerRMSNorm(hidden_size, eps=eps)
 
         self.attn = MMDiTAttention(hidden_size, num_heads, eps=eps)
 
@@ -275,7 +275,7 @@ class DualStreamDiT(nn.Module):
             num_layers=2,
             num_attention_heads=num_heads,
             ffn_expansion_ratio=mlp_ratio,
-            use_checkpointing= False if to_skip_count > 0 else self.use_checkpointing,
+            use_checkpointing=False if to_skip_count > 0 else self.use_checkpointing,
             norm_type=norm_type,
             activation_func=activation_func,
         )
@@ -295,7 +295,9 @@ class DualStreamDiT(nn.Module):
                     num_heads,
                     mlp_ratio,
                     eps=eps,
-                    use_checkpointing=False if (to_skip_count - i / i) > 0 else self.use_checkpointing,
+                    use_checkpointing=False
+                    if (to_skip_count - i / i) > 0
+                    else self.use_checkpointing,
                 )
                 for i in range(1, num_in_blocks + 1)
             ]
@@ -319,13 +321,15 @@ class DualStreamDiT(nn.Module):
                     mlp_ratio,
                     eps=eps,
                     use_skip=True,
-                    use_checkpointing=False if (to_skip_count - i / i) > 0 else self.use_checkpointing,
+                    use_checkpointing=False
+                    if (to_skip_count - i / i) > 0
+                    else self.use_checkpointing,
                 )
                 for i in range(1, num_in_blocks + 1)
             ]
         )
 
-        self.norm_final = nn.RMSNorm(hidden_size, eps=eps)
+        self.norm_final = LigerRMSNorm(hidden_size, eps=eps)
         self.proj_out = nn.Linear(hidden_size, patch_size * patch_size * out_channels)
 
         self._zero_initialize_output()
