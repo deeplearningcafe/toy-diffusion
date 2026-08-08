@@ -176,7 +176,15 @@ def load_from_checkpoint(
     if scheduler is not None:
         sched_path = os.path.join(checkpoint_dir, "scheduler.pt")
         if os.path.exists(sched_path):
-            scheduler.load_state_dict(torch.load(sched_path, map_location="cpu"))
+            try:
+                scheduler.load_state_dict(
+                    torch.load(sched_path, map_location="cpu")
+                )
+            except Exception as e:
+                logging.error(
+                    f"Could not load scheduler state dict: {e}. "
+                    "Proceeding with initialized scheduler."
+                )
 
     start_epoch = 0
     base_name = os.path.basename(os.path.normpath(checkpoint_dir))

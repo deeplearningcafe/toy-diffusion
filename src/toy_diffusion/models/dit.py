@@ -202,6 +202,7 @@ class LuminaNextDit(nn.Module):
         use_rope_text_adapter: bool = False,
         norm_type: str = "layer_norm",
         activation_func: str = "geglu",
+        skip_checkpointing_layers: int = 0,
     ):
         super().__init__()
         self.patch_size = patch_size
@@ -211,8 +212,14 @@ class LuminaNextDit(nn.Module):
         self.use_i1 = use_i1
         self.use_skip = use_skip
         self.use_checkpointing = use_checkpointing
+        self.skip_checkpointing_layers = skip_checkpointing_layers
         # in the original i1 paper the don't use it
         self.use_rope_text_adapter = use_rope_text_adapter
+
+        def should_checkpoint(layer_idx: int) -> bool:
+            return self.use_checkpointing and (layer_idx >= self.skip_checkpointing_layers)
+
+        current_layer_idx = 0
 
         self.x_embedder = nn.Linear(
             in_features=patch_size * patch_size * in_channels,
@@ -229,16 +236,20 @@ class LuminaNextDit(nn.Module):
                 nn.SiLU(), nn.Linear(hidden_size, hidden_size)
             )
 
+            text_adapter_layers = 2
             self.text_adapter = TransformerTextAdapter(
                 in_channels=cross_attention_dim,
                 hidden_size=hidden_size,
-                num_layers=2,
+                num_layers=text_adapter_layers,
                 num_attention_heads=num_attention_heads,
                 ffn_expansion_ratio=4.0,
-                use_checkpointing=use_checkpointing,
+                use_checkpointing=should_checkpoint(current_layer_idx),
                 norm_type=norm_type,
                 activation_func=activation_func,
             )
+            current_layer_idx += text_adapter_layers
+
+            image_adapter_layers = 2
             self.image_refiner = nn.ModuleList(
                 [
                     LuminaNextDiTBlock(
@@ -248,11 +259,12 @@ class LuminaNextDit(nn.Module):
                         eps=eps,
                         base_sequence_length=None,
                         use_i1=True,
-                        use_checkpointing=use_checkpointing,
+                        use_checkpointing=should_checkpoint(current_layer_idx),
                     )
-                    for _ in range(2)
+                    for _ in range(image_adapter_layers)
                 ]
             )
+            current_layer_idx += image_adapter_layers
 
             head_dim = hidden_size // num_attention_heads
             axes_dims = _default_rope_axes_dims(head_dim)
@@ -262,6 +274,7 @@ class LuminaNextDit(nn.Module):
 
         if self.use_skip:
             num_in = depth // 2
+            in_start_idx = current_layer_idx
             self.in_blocks = nn.ModuleList(
                 [
                     LuminaNextDiTBlock(
@@ -271,11 +284,13 @@ class LuminaNextDit(nn.Module):
                         eps=eps,
                         base_sequence_length=None,
                         use_i1=use_i1,
-                        use_checkpointing=use_checkpointing,
+                        use_checkpointing=should_checkpoint(in_start_idx+1),
                     )
-                    for _ in range(num_in)
+                    for i in range(num_in)
                 ]
             )
+            current_layer_idx += num_in
+
             self.mid_block = LuminaNextDiTBlock(
                 dim=hidden_size,
                 num_attention_heads=num_attention_heads,
@@ -283,8 +298,10 @@ class LuminaNextDit(nn.Module):
                 eps=eps,
                 base_sequence_length=None,
                 use_i1=use_i1,
-                use_checkpointing=use_checkpointing,
+                use_checkpointing=should_checkpoint(current_layer_idx),
             )
+            current_layer_idx += 1
+
             self.out_blocks = nn.ModuleList(
                 [
                     LuminaNextDiTBlock(
@@ -295,11 +312,12 @@ class LuminaNextDit(nn.Module):
                         base_sequence_length=None,
                         use_i1=use_i1,
                         use_skip=True,
-                        use_checkpointing=use_checkpointing,
+                        use_checkpointing=should_checkpoint(in_start_idx+1),
                     )
-                    for _ in range(num_in)
+                    for i in range(num_in)
                 ]
             )
+            current_layer_idx += num_in
         else:
             self.blocks = nn.ModuleList(
                 [

@@ -19,95 +19,113 @@ import warnings
 
 
 class CPUGradientAccumulator:
+    """
+    High-performance CPU Gradient Accumulator using CUDA streams and
+    pinned memory buffers. Eliminates background worker threads and queues
+    to prevent GPU starvation under high host CPU utilization.
+    """
+
     def __init__(self, model):
         self.model = model
         self.grad_buffers = {}
+        self.staging_buffers = {}
 
-        # Stream for async memory transfers
-        self.copy_stream = torch.cuda.Stream() if torch.cuda.is_available() else None
-
-        # Queue and worker thread for background CPU accumulation
-        self.accumulation_queue = queue.Queue()
-        self.worker_thread = threading.Thread(
-            target=self._accumulation_worker, daemon=True
+        self.copy_stream = (
+            torch.cuda.Stream() if torch.cuda.is_available() else None
         )
-        self.worker_thread.start()
-        # The problem with the grad accum is that it's completely cpu dependant
-        # if other process is using 100% cpu then this grad accum is ultra slow
 
-        for name, param in model.named_parameters():
-            if param.requires_grad:
-                self.grad_buffers[param] = torch.zeros(
-                    param.shape, dtype=torch.float32, device="cpu", pin_memory=True
-                )
+        self.trainable_params = [
+            p for p in model.parameters() if p.requires_grad
+        ]
+        self.num_params = len(self.trainable_params)
+        self.hook_counter = 0
+        self.micro_step = 0
 
-                param.register_post_accumulate_grad_hook(self._make_hook(param))
+        for param in self.trainable_params:
+            # Pre-allocate pinned CPU buffers for zero-copy DMA transfers
+            self.grad_buffers[param] = torch.zeros(
+                param.shape,
+                dtype=torch.float32,
+                device="cpu",
+                pin_memory=True,
+            )
+            self.staging_buffers[param] = torch.zeros(
+                param.shape,
+                dtype=torch.float32,
+                device="cpu",
+                pin_memory=True,
+            )
 
-    def _accumulation_worker(self):
-        """
-        Background thread that waits for GPU transfers to finish
-        and then safely adds the gradients to the CPU buffers.
-        """
-        while True:
-            task = self.accumulation_queue.get()
-            if task is None:
-                self.accumulation_queue.task_done()
-                break
-
-            grad_cpu, param, event = task
-
-            if event is not None:
-                # CPU thread waits for the async CUDA transfer to finish.
-                event.synchronize()
-
-            self.grad_buffers[param].add_(grad_cpu)
-
-            # Mark task as complete so we can join() later
-            self.accumulation_queue.task_done()
+            param.register_post_accumulate_grad_hook(
+                self._make_hook(param)
+            )
 
     def _make_hook(self, param):
         def hook_fn(p):
             if p.grad is not None:
                 if self.copy_stream:
-                    # 1. Make copy stream wait for the compute stream to finish the gradient
-                    self.copy_stream.wait_stream(torch.cuda.current_stream())
+                    # Align copy stream with compute stream execution
+                    self.copy_stream.wait_stream(
+                        torch.cuda.current_stream()
+                    )
 
                     with torch.cuda.stream(self.copy_stream):
-                        grad_cpu = p.grad.to("cpu", non_blocking=True).float()
+                        if self.micro_step == 0:
+                            # Direct DMA copy to main CPU buffer on step 0
+                            self.grad_buffers[p].copy_(
+                                p.grad, non_blocking=True
+                            )
+                        else:
+                            # DMA copy to staging buffer on microstep > 0
+                            self.staging_buffers[p].copy_(
+                                p.grad, non_blocking=True
+                            )
 
-                        # Record an event to track when the copy completes
-                        event = torch.cuda.Event()
-                        event.record(self.copy_stream)
-
-                    # Prevent caching allocator from freeing p.grad before copy completes
+                    # Tell allocator memory is in use by copy_stream
                     p.grad.record_stream(self.copy_stream)
 
-                    # Queue the CPU addition for the background thread
-                    self.accumulation_queue.put((grad_cpu, p, event))
+                    if self.micro_step > 0:
+                        self.copy_stream.synchronize()
+                        self.grad_buffers[p].add_(
+                            self.staging_buffers[p]
+                        )
                 else:
-                    grad_cpu = p.grad.to("cpu").float()
-                    self.accumulation_queue.put((grad_cpu, p, None))
+                    if self.micro_step == 0:
+                        self.grad_buffers[p].copy_(p.grad)
+                    else:
+                        self.grad_buffers[p].add_(p.grad.to("cpu"))
 
+                # Free GPU gradient tensor memory immediately
                 p.grad = None
+
+                self.hook_counter += 1
+                if self.hook_counter == self.num_params:
+                    self.hook_counter = 0
+                    self.micro_step += 1
 
         return hook_fn
 
     def finalize_and_step(self, optimizer, scaler=None, max_norm=1.0):
-        # Wait for all background accumulations to finish before stepping!
-        self.accumulation_queue.join()
+        if self.copy_stream:
+            # Wait for any remaining microstep DMA transfers to finish
+            self.copy_stream.synchronize()
 
-        for param, cpu_grad in self.grad_buffers.items():
-            if param.grad is None:
-                # Use zeros_like instead of empty_like to prevent uninitialized memory (NaNs)
-                param.grad = torch.zeros_like(param)
+            # Copy CPU accumulated gradients to GPU asynchronously
+            with torch.cuda.stream(self.copy_stream):
+                for param, cpu_grad in self.grad_buffers.items():
+                    param.grad = torch.empty_like(param)
+                    param.grad.copy_(cpu_grad, non_blocking=True)
 
-            # Use non_blocking=False. Since we immediately zero the CPU buffer below,
-            # an async copy (non_blocking=True) creates a race condition where cpu_grad is
-            # zeroed before the DMA transfer completes, sending zeroes to the GPU.
-            param.grad.copy_(cpu_grad, non_blocking=False)
+            # Synchronize CUDA streams on GPU side (0 CPU waiting)
+            torch.cuda.current_stream().wait_stream(self.copy_stream)
+        else:
+            for param, cpu_grad in self.grad_buffers.items():
+                param.grad = cpu_grad.to(param.device)
 
-            cpu_grad.zero_()
+        self.hook_counter = 0
+        self.micro_step = 0
 
+        # Synchronize gradients across DDP ranks if active
         if torch.distributed.is_initialized():
             world_size = torch.distributed.get_world_size()
             for param in self.grad_buffers.keys():
@@ -117,8 +135,12 @@ class CPUGradientAccumulator:
                     )
                     param.grad.div_(world_size)
 
-        # Calculate Norm & Coef on GPU
-        total_norm = torch.nn.utils.clip_grad_norm_(self.grad_buffers.keys(), max_norm)
+        if scaler is not None:
+            scaler.unscale_(optimizer)
+
+        total_norm = torch.nn.utils.clip_grad_norm_(
+            self.grad_buffers.keys(), max_norm
+        )
 
         if scaler:
             scaler.step(optimizer)
@@ -126,10 +148,8 @@ class CPUGradientAccumulator:
         else:
             optimizer.step()
 
-        # Clear GPU VRAM
         optimizer.zero_grad(set_to_none=True)
         return total_norm
-
 
 # copied from https://github.com/unslothai/unsloth-zoo/blob/main/unsloth_zoo/gradient_checkpointing.py
 # Added [device_type] in Torch 2.5!
@@ -220,35 +240,55 @@ def initialize_unsloth_gradient_checkpointing(dtype=None):
         CPU_BUFFERS.append(x)
     pass
 
-    # Allocate buffers to how many GPUs
+    # Determine total visible GPUs in the environment
     n_gpus = (
-        torch.cuda.device_count() if DEVICE_TYPE == "cuda" else torch.xpu.device_count()
-    )
-    GPU_BUFFERS = tuple(
-        [
-            torch.empty(2 * 256 * 2048, dtype=dtype, device=f"{DEVICE_TYPE}:{i}")
-            for i in range(n_gpus)
-        ]
+        torch.cuda.device_count()
+        if DEVICE_TYPE == "cuda"
+        else torch.xpu.device_count()
     )
 
-    BACKWARD_PASS = True
-    EXTRA_STREAMS = tuple(
-        [
-            torch.cuda.Stream() if DEVICE_TYPE == "cuda" else torch.xpu.Stream()
-            for i in range(n_gpus)
-        ]
-    )
+    # Fetch the active device index set for the current process
     if DEVICE_TYPE == "cuda":
-        MAIN_STREAMS = tuple(
-            [
-                torch.cuda.default_stream(torch.device(f"cuda:{i}"))
-                for i in range(n_gpus)
-            ]
+        current_device_idx = torch.cuda.current_device()
+    elif DEVICE_TYPE == "xpu":
+        current_device_idx = torch.xpu.current_device()
+    else:
+        current_device_idx = 0
+
+    # Initialize a sparse container to allocate buffers only on the active GPU
+    GPU_BUFFERS = [None] * n_gpus
+    GPU_BUFFERS[current_device_idx] = torch.empty(
+        2 * 256 * 2048,
+        dtype=dtype,
+        device=f"{DEVICE_TYPE}:{current_device_idx}"
+    )
+    GPU_BUFFERS = tuple(GPU_BUFFERS)
+
+    BACKWARD_PASS = True
+
+    # Allocate a stream only on the process's active GPU
+    EXTRA_STREAMS = [None] * n_gpus
+    if DEVICE_TYPE == "cuda":
+        EXTRA_STREAMS[current_device_idx] = torch.cuda.Stream(
+            device=current_device_idx
         )
     elif DEVICE_TYPE == "xpu":
-        MAIN_STREAMS = tuple(
-            [torch.xpu.current_stream(torch.device(f"xpu:{i}")) for i in range(n_gpus)]
+        EXTRA_STREAMS[current_device_idx] = torch.xpu.Stream(
+            device=current_device_idx
         )
+    EXTRA_STREAMS = tuple(EXTRA_STREAMS)
+
+    # Bind default streams exclusively on the process's active GPU
+    MAIN_STREAMS = [None] * n_gpus
+    if DEVICE_TYPE == "cuda":
+        MAIN_STREAMS[current_device_idx] = torch.cuda.default_stream(
+            torch.device(f"cuda:{current_device_idx}")
+        )
+    elif DEVICE_TYPE == "xpu":
+        MAIN_STREAMS[current_device_idx] = torch.xpu.current_stream(
+            torch.device(f"xpu:{current_device_idx}")
+        )
+    MAIN_STREAMS = tuple(MAIN_STREAMS)
 
     # Minimum size to enable Unsloth GC is 2MB -> 32 layers = 64MB
     n_bytes = torch.finfo(dtype).bits // 8
@@ -260,8 +300,6 @@ def initialize_unsloth_gradient_checkpointing(dtype=None):
     LAST_GC_INDEX = 0
     FIRST_PASS = True
     CURRENT_GC_INDEX = 0
-
-
 class UnslothCheckpointFunction(torch.autograd.Function):
     @staticmethod
     def forward(ctx, run_function, preserve_rng_state, *args):

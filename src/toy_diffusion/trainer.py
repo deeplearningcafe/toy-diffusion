@@ -137,8 +137,9 @@ class Trainer:
         self.start_epoch = 0
         resume_dir = config.get("resume_from_checkpoint", None)
         if resume_dir is not None:
-            ignore_scheduler = self.config.get(
-                "ignore_checkpoint_scheduler", False
+            ignore_scheduler = (
+                self.config.get("ignore_checkpoint_scheduler", False)
+                or not self.config.get("use_scheduler", True)
             )
             self.start_epoch, ckpt_cfg, ckpt_vocab = load_from_checkpoint(
                 checkpoint_dir=resume_dir,
