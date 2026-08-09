@@ -6,6 +6,7 @@ import logging
 import toml
 import os
 import random
+import time
 
 from toy_diffusion.utils.trainer_utils import (
     get_model,
@@ -176,6 +177,12 @@ class Trainer:
                 if self.ema.ema_model is None:
                     self.ema.initialize(self.model)
 
+        self.patch_size = getattr(self.model["unet"], "patch_size", 2)
+        self.num_params = self.model["unet"].get_params()
+        self.peak_tflops = self.config.get("gpu_peak_tflops", 165.2)
+        # normally 8 is used but as attention is not recomputed we will use 7
+        self.factor = 6 if not self.config.get("use_gradient_checkpointing", False) else 7
+
         if config.get("use_gradient_checkpointing", False):
             patch_unsloth_smart_gradient_checkpointing(dtype=torch.bfloat16)
 
@@ -183,6 +190,8 @@ class Trainer:
             logging.info("Compiling model with torch.compile for faster training...")
             patch_torch_compile()
             patch_compiled_autograd()
+            # self.loss_fn = torch.compile(self.loss_fn)
+
             if isinstance(self.model, torch.nn.ModuleDict) and "unet" in self.model:
                 self.model["unet"] = torch.compile(self.model["unet"])
                 # skip text encoder compile
@@ -216,14 +225,17 @@ class Trainer:
         prompt = None
         if self.conditional:
             x, prompt_tokens, prompt_mask = batch
+            # Use non_blocking=True to overlap PCIe transfer with CPU execution
+            x = x.to(self.device, non_blocking=True).float()
+            prompt_tokens = prompt_tokens.to(self.device, non_blocking=True)
+            prompt_mask = prompt_mask.to(self.device, non_blocking=True)
             prompt = (prompt_tokens, prompt_mask)
         else:
-            x = batch
-        # Handle Tuple Batches (Reflow)
-        if isinstance(x, (list, tuple)):
-            x = [b.to(self.device).float() for b in x]
-        else:
-            x = x.to(self.device).float()
+            # Handle Tuple Batches (Reflow)
+            if isinstance(x, (list, tuple)):
+                x = [b.to(self.device, non_blocking=True).float() for b in x]
+            else:
+                x = batch.to(self.device, non_blocking=True).float()
 
         with torch.autocast(
             device_type=self.device,
@@ -268,7 +280,54 @@ class Trainer:
         total_loss = torch.tensor([0.0], device=self.device)
         self.optimizer.zero_grad(set_to_none=True)
 
+        total_images = 0
+        total_tokens = 0
+        use_cuda = self.device == "cuda" or (
+            isinstance(self.device, str) and "cuda" in self.device
+        )
+
+        if use_cuda:
+            t_start = torch.cuda.Event(enable_timing=True)
+            t_end = torch.cuda.Event(enable_timing=True)
+            torch.cuda.synchronize()
+            t_start.record()
+        else:
+            start_time = time.perf_counter()
+
         for step, batch in tqdm(enumerate(dataloader), total=len(dataloader)):
+            prompt_tokens = None
+            prompt_mask = None
+
+            if self.conditional:
+                x, prompt_tokens, prompt_mask = batch
+            else:
+                x = batch
+
+            # Handle batch size and image token counting
+            if isinstance(x, (list, tuple)):
+                batch_size = x[0].shape[0]
+                img_shape = x[0].shape
+            else:
+                batch_size = x.shape[0]
+                img_shape = x.shape
+
+            if len(img_shape) == 4:
+                _, _, h_dim, w_dim = img_shape
+                img_tokens = (h_dim // self.patch_size) * (w_dim // self.patch_size)
+            else:
+                img_tokens = img_shape[-1]
+
+            # Count text tokens if conditional
+            text_tokens = 0
+            if self.conditional and prompt_mask is not None:
+                text_tokens = prompt_mask.bool().sum().item()
+            elif self.conditional and prompt_tokens is not None:
+                text_tokens = prompt_tokens.numel()
+
+            batch_tokens = batch_size * img_tokens + text_tokens
+            total_images += batch_size
+            total_tokens += batch_tokens
+
             loss = self.train_step(batch)
             total_loss += loss.detach()
 
@@ -306,7 +365,35 @@ class Trainer:
 
                 self.ema.update(self.model)
 
-        return total_loss.item() / len(dataloader)
+        
+        if use_cuda:
+            t_end.record()
+            torch.cuda.synchronize()
+            elapsed = max(t_start.elapsed_time(t_end) / 1000.0, 1e-6)
+        else:
+            elapsed = max(time.perf_counter() - start_time, 1e-6)
+        imgs_per_sec = total_images / elapsed
+        tokens_per_sec = total_tokens / elapsed
+
+        # factor * N_params * tokens estimate for forward + backward pass
+        model_flops = 6 * self.num_params * total_tokens
+        hardware_flops = self.factor * self.num_params * total_tokens
+
+        tflops = (model_flops / elapsed) / 1e12
+        hw_tflops = (hardware_flops / elapsed) / 1e12
+
+        mfu = (tflops / self.peak_tflops) * 100.0 if self.peak_tflops > 0 else 0.0
+        hfu = (hw_tflops / self.peak_tflops) * 100.0 if self.peak_tflops > 0 else 0.0
+
+        metrics = {
+            "imgs_per_sec": imgs_per_sec,
+            "tokens_per_sec": tokens_per_sec,
+            "tflops": tflops,
+            "mfu": mfu,
+            "hfu": hfu,
+        }
+
+        return total_loss.item() / len(dataloader), metrics
 
     def train(
         self,
@@ -342,7 +429,7 @@ class Trainer:
                 logging.info(f"Initializing EMA model at epoch {epoch}")
                 self.ema.initialize(self.model)
 
-            loss = self.train_epoch(dataloader)
+            loss, metrics = self.train_epoch(dataloader)
 
             if (epoch + 1) % log_interval == 0 or (epoch + 1) == epochs:
                 if isinstance(self.optimizer, dict):
@@ -351,7 +438,13 @@ class Trainer:
                     lr_val = self.optimizer.param_groups[0]["lr"]
 
                 logging.info(
-                    f"[Epoch {epoch + 1}/{epochs}] Loss: {loss:.6f} LR: {lr_val:.3e}"
+                    f"[Epoch {epoch + 1}/{epochs}] Loss: {loss:.6f} | "
+                    f"Imgs/s: {metrics['imgs_per_sec']:.2f} | "
+                    f"Tokens/s: {metrics['tokens_per_sec']:.2f} | "
+                    f"TFLOPS: {metrics['tflops']:.2f} | "
+                    f"MFU: {metrics['mfu']:.2f}% | "
+                    f"HFU: {metrics['hfu']:.2f}% | "
+                    f"LR: {lr_val:.3e}"
                 )
 
             if (epoch + 1) % sample_interval == 0 or (epoch + 1) == epochs:

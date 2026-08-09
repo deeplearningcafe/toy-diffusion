@@ -1,6 +1,5 @@
 import torch
 import torch.nn as nn
-from liger_kernel.transformers import LigerRMSNorm
 
 from toy_diffusion.models.layers import (
     Attention,
@@ -27,7 +26,7 @@ class LuminaRMSNormZero(nn.Module):
             4 * embedding_dim,
             bias=True,
         )
-        self.norm = LigerRMSNorm(embedding_dim, eps=eps)
+        self.norm = nn.RMSNorm(embedding_dim, eps=eps)
 
     def forward(self, x: torch.Tensor, emb: torch.Tensor):
         emb = self.linear(self.silu(emb))
@@ -67,7 +66,7 @@ class LuminaNextDiTBlock(nn.Module):
         if not use_i1:
             self.norm1 = LuminaRMSNormZero(embedding_dim=dim, eps=eps)
         else:
-            self.norm1 = LigerRMSNorm(dim, eps=eps)
+            self.norm1 = nn.RMSNorm(dim, eps=eps)
 
         self.attn1 = Attention(
             in_channels=dim,
@@ -78,11 +77,11 @@ class LuminaNextDiTBlock(nn.Module):
             base_sequence_length=base_sequence_length,
         )
 
-        self.norm2 = LigerRMSNorm(dim, eps=eps)
+        self.norm2 = nn.RMSNorm(dim, eps=eps)
 
-        self.ffn_norm1 = LigerRMSNorm(dim, eps=eps)
+        self.ffn_norm1 = nn.RMSNorm(dim, eps=eps)
         self.feed_forward = Feedforward(in_channels=dim)
-        self.ffn_norm2 = LigerRMSNorm(dim, eps=eps)
+        self.ffn_norm2 = nn.RMSNorm(dim, eps=eps)
 
     def _checkpoint(self, module, *args, **kwargs):
         if self.use_checkpointing:
@@ -335,7 +334,7 @@ class LuminaNextDit(nn.Module):
                 ]
             )
 
-        self.norm_out = LigerRMSNorm(hidden_size, eps=eps)
+        self.norm_out = nn.RMSNorm(hidden_size, eps=eps)
         self.proj_out = nn.Linear(hidden_size, patch_size * patch_size * out_channels)
 
         self._zero_initialize_output()

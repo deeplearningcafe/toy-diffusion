@@ -3,8 +3,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import math
-from liger_kernel.transformers import LigerRMSNorm, LigerLayerNorm
-from liger_kernel.ops import LigerSiLUMulFunction, LigerGELUMulFunction
 
 HAS_FLASH_ATTENTION = False
 try:
@@ -422,8 +420,8 @@ class Attention(nn.Module):
         self.norm_q = None
         self.norm_k = None
         if qk_norm == "rms_norm":
-            self.norm_q = LigerRMSNorm(self.head_dim, eps=eps)
-            self.norm_k = LigerRMSNorm(self.head_dim, eps=eps)
+            self.norm_q = nn.RMSNorm(self.head_dim, eps=eps)
+            self.norm_k = nn.RMSNorm(self.head_dim, eps=eps)
 
         if self.use_flash_attention:
             self.forward = self.forward_flash_attention
@@ -580,7 +578,7 @@ class GEGLU(nn.Module):
 
     def forward(self, x):
         hidden_states, gate = self.proj_in(x).chunk(2, dim=-1)
-        return LigerGELUMulFunction.apply(gate, hidden_states)
+        return hidden_states * torch.nn.functional.gelu(gate)
 
 
 class SwiGLU(nn.Module):
@@ -601,7 +599,7 @@ class SwiGLU(nn.Module):
 
     def forward(self, x):
         hidden_states, gate = self.proj_in(x).chunk(2, dim=-1)
-        return LigerSiLUMulFunction.apply(gate, hidden_states)
+        return hidden_states * torch.nn.functional.silu(gate)
 
 
 class Feedforward(nn.Module):
@@ -653,9 +651,9 @@ class TransformerBlock(nn.Module):
 
         def get_norm(dim):
             if norm_type == "layer_norm":
-                return LigerLayerNorm(dim)
+                return nn.LayerNorm(dim)
             elif norm_type == "rms_norm":
-                return LigerRMSNorm(dim)
+                return nn.RMSNorm(dim)
             else:
                 raise ValueError(f"Unknown norm_type: {norm_type}")
 

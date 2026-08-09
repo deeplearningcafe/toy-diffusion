@@ -15,29 +15,26 @@ from toy_diffusion.models.dual_stream import (
 
 def structured_token_drop(x, h_patches, w_patches, n=2, k=1):
     """
-    Structured group-wise subsampling (Section 3.5 in the SPRINT paper).
-    Divides the token grid into non-overlapping n x n groups and randomly
-    selects k tokens from each group to guarantee local feature coverage.
+    Structured group-wise subsampling (Section 3.5 in SPRINT paper).
+    Torch.compile friendly without graph breaks.
     """
     B, N, D = x.shape
     device = x.device
 
-    # naive random drop if dimensions are incompatible
-    if (h_patches % n != 0) or (w_patches % n != 0) or (h_patches * w_patches != N):
+    if (
+        (h_patches % n != 0)
+        or (w_patches % n != 0)
+        or (h_patches * w_patches != N)
+    ):
         drop_ratio = 1.0 - (k / (n * n))
         return random_token_drop(x, drop_ratio)
 
-    h_groups = h_patches // n
-    w_groups = w_patches // n
-    num_groups = h_groups * w_groups
-    group_size = n * n
+    h_groups, w_groups = h_patches // n, w_patches // n
+    num_groups, group_size = h_groups * w_groups, n * n
 
-    # [B, num_groups, group_size] -> perturbation noise to extract indices
     noise = torch.rand(B, num_groups, group_size, device=device)
-    ids_group_shuffle = torch.argsort(noise, dim=-1)
-    ids_group_keep = ids_group_shuffle[:, :, :k]
+    ids_group_keep = torch.argsort(noise, dim=-1)[:, :, :k]
 
-    # Reconstruct global 2D grid coordinates back from the group relative ones
     group_idx_h = (
         torch.arange(h_groups, device=device)
         .view(1, h_groups, 1, 1)
@@ -49,19 +46,17 @@ def structured_token_drop(x, h_patches, w_patches, n=2, k=1):
         .expand(B, h_groups, -1, k)
     )
 
-    local_h = ids_group_keep // n
-    local_w = ids_group_keep % n
-
-    local_h = local_h.view(B, h_groups, w_groups, k)
-    local_w = local_w.view(B, h_groups, w_groups, k)
+    local_h = (ids_group_keep // n).view(B, h_groups, w_groups, k)
+    local_w = (ids_group_keep % n).view(B, h_groups, w_groups, k)
 
     global_h = group_idx_h * n + local_h
     global_w = group_idx_w * n + local_w
 
-    # Flatten to 1D index
     global_indices = global_h * w_patches + global_w
     ids_keep = global_indices.view(B, -1)
+    K = ids_keep.shape[1]
 
+    # Mask creation and compile-friendly complement index calculation
     mask_keep = torch.zeros(B, N, dtype=torch.bool, device=device)
     mask_keep.scatter_(
         dim=1,
@@ -69,12 +64,19 @@ def structured_token_drop(x, h_patches, w_patches, n=2, k=1):
         src=torch.ones_like(ids_keep, dtype=torch.bool),
     )
 
-    original_indices = torch.arange(N, device=device).unsqueeze(0).expand(B, -1)
-    priority = mask_keep.float() * N + original_indices.float() / (N + 1)
-    ids_shuffle = torch.argsort(priority, dim=1, descending=True)
+    mask_drop = (~mask_keep).float()
+    original_indices = torch.arange(N, device=device).unsqueeze(0)
+    drop_priority = mask_drop * N + original_indices.float() / (N + 1)
+    ids_drop = torch.argsort(drop_priority, dim=1, descending=True)[
+        :, : N - K
+    ]
+
+    ids_shuffle = torch.cat([ids_keep, ids_drop], dim=1)
     ids_restore = torch.argsort(ids_shuffle, dim=1)
 
-    x_masked = torch.gather(x, dim=1, index=ids_keep.unsqueeze(-1).expand(-1, -1, D))
+    x_masked = torch.gather(
+        x, dim=1, index=ids_keep.unsqueeze(-1).expand(-1, -1, D)
+    )
 
     return x_masked, ids_keep, ids_restore
 
@@ -835,7 +837,7 @@ class SprintDualStreamDiT(DualStreamDiT):
                 )
 
         # Residual Fusion
-        if should_drop and self.residual_type == "concat_linear":
+        if self.residual_type == "concat_linear":
             if self.drop_target in ["image", "both"]:
                 image_tokens = torch.cat([image_tokens, image_tokens_clone], dim=-1)
                 image_tokens = self.renoise_linear_image(image_tokens)

@@ -2,8 +2,6 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from liger_kernel.transformers import LigerRMSNorm
-from liger_kernel.ops import LigerSiLUMulFunction
 
 from toy_diffusion.models.layers import (
     TimeEmbeddings,
@@ -46,7 +44,7 @@ class SwiGLUFFN(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x1, x2 = self.w12(x).chunk(2, dim=-1)
-        return self.w3(LigerSiLUMulFunction.apply(x1, x2))
+        return self.w3(F.silu(x1) * x2)
 
 
 class MMDiTAttention(nn.Module):
@@ -59,8 +57,8 @@ class MMDiTAttention(nn.Module):
         self.qkv_image = nn.Linear(hidden_size, 3 * hidden_size)
         self.qkv_text = nn.Linear(hidden_size, 3 * hidden_size)
 
-        self.q_norm = LigerRMSNorm(self.head_dim, eps=eps)
-        self.k_norm = LigerRMSNorm(self.head_dim, eps=eps)
+        self.q_norm = nn.RMSNorm(self.head_dim, eps=eps)
+        self.k_norm = nn.RMSNorm(self.head_dim, eps=eps)
 
         self.proj_image = nn.Linear(hidden_size, hidden_size)
         self.proj_text = nn.Linear(hidden_size, hidden_size)
@@ -133,10 +131,10 @@ class DualStreamDiTBlock(nn.Module):
             self.skip_linear_text = nn.Linear(2 * hidden_size, hidden_size)
 
         # Sandwich Norm
-        self.norm1 = LigerRMSNorm(hidden_size, eps=eps)
-        self.norm2 = LigerRMSNorm(hidden_size, eps=eps)
-        self.norm3 = LigerRMSNorm(hidden_size, eps=eps)
-        self.norm4 = LigerRMSNorm(hidden_size, eps=eps)
+        self.norm1 = nn.RMSNorm(hidden_size, eps=eps)
+        self.norm2 = nn.RMSNorm(hidden_size, eps=eps)
+        self.norm3 = nn.RMSNorm(hidden_size, eps=eps)
+        self.norm4 = nn.RMSNorm(hidden_size, eps=eps)
 
         self.attn = MMDiTAttention(hidden_size, num_heads, eps=eps)
 
@@ -333,7 +331,7 @@ class DualStreamDiT(nn.Module):
         )
         current_layer_idx += num_in_blocks
 
-        self.norm_final = LigerRMSNorm(hidden_size, eps=eps)
+        self.norm_final = nn.RMSNorm(hidden_size, eps=eps)
         self.proj_out = nn.Linear(hidden_size, patch_size * patch_size * out_channels)
 
         self._zero_initialize_output()
