@@ -94,6 +94,7 @@ def run_anime_faces_experiment(args):
             num_workers=config["num_workers"],
             persistent_workers=True if config["num_workers"] > 0 else False,
             pin_memory=True,
+            prefetch_factor=4,
         )
     else:
         dataloader = DataLoader(
@@ -103,6 +104,7 @@ def run_anime_faces_experiment(args):
             persistent_workers=True if config["num_workers"] > 0 else False,
             shuffle=True,
             pin_memory=True,
+            prefetch_factor=4,
         )
 
     # if is latents then infer channels from data

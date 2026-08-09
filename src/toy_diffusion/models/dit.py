@@ -340,6 +340,9 @@ class LuminaNextDit(nn.Module):
 
         self._zero_initialize_output()
 
+    def get_params(self,) -> int:
+        return sum(p.numel() for p in self.parameters() if p.requires_grad)
+
     def _zero_initialize_output(self):
         nn.init.zeros_(self.proj_out.weight)
         nn.init.zeros_(self.proj_out.bias)
