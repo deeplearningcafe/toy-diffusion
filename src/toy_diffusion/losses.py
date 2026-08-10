@@ -151,6 +151,18 @@ class GeneralDiffusionLoss(nn.Module):
             return model["unet"](z_t, t)
         return model(z_t, t)
 
+    def _compute_ot_eps(self, data: torch.Tensor, eps: torch.Tensor):
+        """Runs non-compilable Optimal Transport in eager mode."""
+        B = data.shape[0]
+        data_flat = data.view(B, -1)
+        eps_flat = eps.view(B, -1)
+        _, (row_idx, col_idx) = euclidean_optimal_transport(
+            data_flat, eps_flat
+        )
+        eps_sorted = torch.empty_like(eps)
+        eps_sorted[row_idx] = eps[col_idx]
+        return eps_sorted
+
     def _solve_linear_system(self, pred, z_t, alpha, sigma, d_alpha, d_sigma):
         """
         Solves the system to convert the model prediction to all other forms (x, eps, v).
@@ -213,38 +225,23 @@ class GeneralDiffusionLoss(nn.Module):
 
         return x_pred, eps_pred, v_pred
 
-    def forward(self, model, x, prompt=None):
-        # Handle Reflow tuples (Noise, Data)
-        if isinstance(x, (list, tuple)):
-            eps, data = x
-            B = data.shape[0]
-            device = data.device
-        else:
-            data = x
-            B = data.shape[0]
-            device = data.device
-            eps = torch.randn_like(data)
+    def _compiled_loss_step(self, model, data, eps, prompt):
+        """Full compilable loss execution pass without graph breaks."""
+        B = data.shape[0]
+        device = data.device
 
-            if self.use_ot:
-                data_flat = data.view(B, -1)
-                eps_flat = eps.view(B, -1)
-
-                _, (row_idx, col_idx) = euclidean_optimal_transport(data_flat, eps_flat)
-
-                # Reorder eps based on the optimal assignment
-                eps_sorted = torch.empty_like(eps)
-                eps_sorted[row_idx] = eps[col_idx]
-                eps = eps_sorted
-
-        t = self.timestep_sampling_fn(B, device, shift=self.train_shift)
+        t = self.timestep_sampling_fn(
+            B, device, shift=self.train_shift
+        )
         t_view = t.view(-1, *([1] * (data.ndim - 1)))
 
         alpha, sigma, d_alpha, d_sigma = self.schedule.get_coefficients(t_view)
 
-        noise_perturb = torch.zeros_like(data)
         if self.input_perturbation > 0.0:
-            noise_perturb = torch.randn_like(data) * self.input_perturbation
-            eps += noise_perturb
+            noise_perturb = (
+                torch.randn_like(data) * self.input_perturbation
+            )
+            eps = eps + noise_perturb
 
         z_t = alpha * data + sigma * eps
 
@@ -288,9 +285,18 @@ class GeneralDiffusionLoss(nn.Module):
             )
             loss = loss - 0.05 * contrast_loss
 
-        # Sum over batch
         return torch.sum(loss) / B
 
+    def forward(self, model, x, prompt=None):
+        if isinstance(x, (list, tuple)):
+            eps, data = x
+        else:
+            data = x
+            eps = torch.randn_like(data)
+            if self.use_ot:
+                eps = self._compute_ot_eps(data, eps)
+
+        return self._compiled_loss_step(model, data, eps, prompt)
 
 class EDMLoss(nn.Module):
     """

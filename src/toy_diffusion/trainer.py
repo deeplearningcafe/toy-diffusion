@@ -190,7 +190,11 @@ class Trainer:
             logging.info("Compiling model with torch.compile for faster training...")
             patch_torch_compile()
             patch_compiled_autograd()
-            # self.loss_fn = torch.compile(self.loss_fn)
+            # Compile loss sub-step isolating eager OT
+            if hasattr(self.loss_fn, "_compiled_loss_step"):
+                self.loss_fn._compiled_loss_step = torch.compile(
+                    self.loss_fn._compiled_loss_step
+                )
 
             if isinstance(self.model, torch.nn.ModuleDict) and "unet" in self.model:
                 self.model["unet"] = torch.compile(self.model["unet"])
@@ -229,6 +233,10 @@ class Trainer:
             x = x.to(self.device, non_blocking=True).float()
             prompt_tokens = prompt_tokens.to(self.device, non_blocking=True)
             prompt_mask = prompt_mask.to(self.device, non_blocking=True)
+            # Mark sequence length (dim 1) as dynamic for Dynamo
+            torch._dynamo.maybe_mark_dynamic(prompt_tokens, 1)
+            torch._dynamo.maybe_mark_dynamic(prompt_mask, 1)
+
             prompt = (prompt_tokens, prompt_mask)
         else:
             # Handle Tuple Batches (Reflow)

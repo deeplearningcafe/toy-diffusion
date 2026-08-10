@@ -203,25 +203,10 @@ class SimpleTextEncoder(nn.Module):
             attention_mask = not_pad_mask | shifted_mask
 
         else:
+            # already padded
             batch_tensor, attention_mask = inputs
             batch_tensor = batch_tensor.to(device)
             attention_mask = attention_mask.to(device)
-
-            not_pad = batch_tensor != self.pad_id
-            if not_pad.any():
-                local_max_len = not_pad.sum(dim=1).max().item()
-            else:
-                local_max_len = 1
-
-            if local_max_len <= self.tiers_len[0]:
-                target_len = min(self.tiers_len[0], self.max_seq_len)
-            elif local_max_len <= self.tiers_len[1]:
-                target_len = min(self.tiers_len[1], self.max_seq_len)
-            else:
-                target_len = self.max_seq_len
-
-            batch_tensor = batch_tensor[:, :target_len]
-            attention_mask = attention_mask[:, :target_len]
 
         # Generate position IDs and add to embeddings
         seq_len = batch_tensor.size(1)

@@ -18,23 +18,22 @@ def _apply_multimodal_rope(
     if freqs is None:
         return x
     cos, sin = freqs
-    dtype = x.dtype
+    orig_dtype = x.dtype
     sh = x.shape
-    # x shape: [B, SeqLen, Heads, HeadDim]
-    # reshape instead of unbind+stack
-    x_pair = x.float().view(*sh[:-1], sh[-1] // 2, 2)
+
+    # Real-valued elementwise math (fuses cleanly in TorchInductor)
+    x_pair = x.float().view(*sh[:-1], -1, 2)
     x0 = x_pair[..., 0]
     x1 = x_pair[..., 1]
 
-    # cos, sin shape: [B, SeqLen, HeadDim // 2] -> [B, SeqLen, 1, HeadDim // 2]
     cos = cos.unsqueeze(2).float()
     sin = sin.unsqueeze(2).float()
 
-    out0 = x0 * cos - x1 * sin
-    out1 = x0 * sin + x1 * cos
-    out = torch.stack((out0, out1), dim=-1)
-    return out.view(sh).to(dtype)
+    out0 = (x0 * cos - x1 * sin).unsqueeze(-1)
+    out1 = (x0 * sin + x1 * cos).unsqueeze(-1)
 
+    out = torch.cat([out0, out1], dim=-1).reshape(sh)
+    return out.to(orig_dtype)
 
 class SwiGLUFFN(nn.Module):
     def __init__(self, hidden_size: int, hidden_features: int) -> None:
@@ -347,31 +346,41 @@ class DualStreamDiT(nn.Module):
         bsz, text_len = text_mask.shape
         device = text_mask.device
 
-        # Text Coordinates: (pos, 0, 0). Time token is at pos 0, words are 1..text_len
-        caption_positions = torch.arange(text_len, dtype=torch.long, device=device)[
-            None
-        ].expand(bsz, text_len)
+        caption_positions = torch.arange(
+            text_len, dtype=torch.long, device=device
+        )[None].expand(bsz, text_len)
         caption_positions = torch.where(
-            text_mask.bool(), caption_positions, torch.zeros_like(caption_positions)
+            text_mask.bool(),
+            caption_positions,
+            torch.zeros_like(caption_positions),
         )
         zeros = torch.zeros_like(caption_positions)
-        caption_ids = torch.stack((caption_positions, zeros, zeros), dim=-1)
+        caption_ids = torch.stack(
+            (caption_positions, zeros, zeros), dim=-1
+        )
 
-        # Image Coordinates: (L, y, x). L is the length of the valid text prompt.
         num_image_tokens = h * w
         text_lengths = text_mask.sum(dim=1, dtype=torch.long)
 
-        row_ids = (
-            torch.arange(h, device=device)
-            .repeat_interleave(w)[None]
-            .expand(bsz, num_image_tokens)
+        # Vectorized meshgrid construction without repeat_interleave
+        grid_y, grid_x = torch.meshgrid(
+            torch.arange(h, device=device),
+            torch.arange(w, device=device),
+            indexing="ij",
         )
-        col_ids = (
-            torch.arange(w, device=device).repeat(h)[None].expand(bsz, num_image_tokens)
+        row_ids = grid_y.reshape(-1)[None].expand(
+            bsz, num_image_tokens
         )
-        image_time = text_lengths[:, None].expand(bsz, num_image_tokens)
+        col_ids = grid_x.reshape(-1)[None].expand(
+            bsz, num_image_tokens
+        )
+        image_time = text_lengths[:, None].expand(
+            bsz, num_image_tokens
+        )
 
-        image_ids = torch.stack((image_time, row_ids, col_ids), dim=-1)
+        image_ids = torch.stack(
+            (image_time, row_ids, col_ids), dim=-1
+        )
 
         return caption_ids, image_ids
 
