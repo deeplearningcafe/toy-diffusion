@@ -536,6 +536,8 @@ class Trainer:
         return_traj=True,
         vae_batch_size=32,
         prompts=None,
+        negative_prompt=None,
+        cfg_scale=None,
         filter_type="none",
         keep_ratio=1.0,
         var_timesteps=15,
@@ -563,12 +565,23 @@ class Trainer:
 
         embeddings = None
         attention_mask = None
-        cfg_scale = self.config.get("sampling", {}).get("cfg_scale", 1.0)
+        if cfg_scale is None:
+            cfg_scale = self.config.get(
+                "cfg_scale",
+                self.config.get("sampling", {}).get("cfg_scale", 1.0),
+            )
 
         if self.conditional:
             if prompts is not None:
                 assert len(prompts) == num_sampling
-                neg_prompts = [""] * num_sampling
+                if negative_prompt is None:
+                    neg_prompts = [""] * num_sampling
+                elif isinstance(negative_prompt, str):
+                    neg_prompts = [negative_prompt] * num_sampling
+                else:
+                    neg_prompts = list(negative_prompt)
+                    assert len(neg_prompts) == num_sampling
+
                 full_prompts = neg_prompts + prompts if cfg_scale > 1.0 else prompts
             else:
                 prompts_list = [""] * num_sampling

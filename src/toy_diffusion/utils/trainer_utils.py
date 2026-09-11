@@ -47,6 +47,7 @@ from toy_diffusion.utils.checkpointing import load_checkpoint_vocab
 def get_model(config, device):
     text_enc = None
     cross_attention_dim = config.get("cross_attention_dim", None)
+    use_pixel_decoder = config.get("use_pixel_decoder", False)
 
     if config.get("is_conditional", False):
         hf_model_id = config.get("hf_text_encoder", None)
@@ -146,6 +147,7 @@ def get_model(config, device):
             norm_type=config.get("norm_type", "layer_norm"),
             activation_func=config.get("activation_func", "geglu"),
             skip_checkpointing_layers=config.get("skip_checkpointing_layers", 0),
+            use_pixel_decoder=use_pixel_decoder,
         ).to(device)
 
         model = (
@@ -179,6 +181,7 @@ def get_model(config, device):
         )
     elif config["model_type"] in ["sprint_single", "sprint_dual"]:
         in_channels = config.get("in_channels", 3)
+        use_random_drop = config.get("use_random_drop", True)
         if config["model_type"] == "sprint_single":
             unet = SprintLuminaNextDit(
                 in_channels=in_channels,
@@ -218,6 +221,8 @@ def get_model(config, device):
                 norm_type=config.get("norm_type", "layer_norm"),
                 activation_func=config.get("activation_func", "geglu"),
                 skip_checkpointing_layers=config.get("skip_checkpointing_layers", 0),
+                use_random_drop=use_random_drop,
+                use_pixel_decoder=use_pixel_decoder,
             ).to(device)
 
         model = (

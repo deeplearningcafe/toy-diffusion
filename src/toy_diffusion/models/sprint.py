@@ -10,6 +10,7 @@ from toy_diffusion.models.dual_stream import (
     DualStreamDiTBlock,
     MultimodalRopeEmbedder,
     _default_rope_axes_dims,
+    LocalDecoder,
 )
 
 
@@ -21,11 +22,7 @@ def structured_token_drop(x, h_patches, w_patches, n=2, k=1):
     B, N, D = x.shape
     device = x.device
 
-    if (
-        (h_patches % n != 0)
-        or (w_patches % n != 0)
-        or (h_patches * w_patches != N)
-    ):
+    if (h_patches % n != 0) or (w_patches % n != 0) or (h_patches * w_patches != N):
         drop_ratio = 1.0 - (k / (n * n))
         return random_token_drop(x, drop_ratio)
 
@@ -67,16 +64,12 @@ def structured_token_drop(x, h_patches, w_patches, n=2, k=1):
     mask_drop = (~mask_keep).float()
     original_indices = torch.arange(N, device=device).unsqueeze(0)
     drop_priority = mask_drop * N + original_indices.float() / (N + 1)
-    ids_drop = torch.argsort(drop_priority, dim=1, descending=True)[
-        :, : N - K
-    ]
+    ids_drop = torch.argsort(drop_priority, dim=1, descending=True)[:, : N - K]
 
     ids_shuffle = torch.cat([ids_keep, ids_drop], dim=1)
     ids_restore = torch.argsort(ids_shuffle, dim=1)
 
-    x_masked = torch.gather(
-        x, dim=1, index=ids_keep.unsqueeze(-1).expand(-1, -1, D)
-    )
+    x_masked = torch.gather(x, dim=1, index=ids_keep.unsqueeze(-1).expand(-1, -1, D))
 
     return x_masked, ids_keep, ids_restore
 
@@ -524,6 +517,8 @@ class SprintDualStreamDiT(DualStreamDiT):
         norm_type: str = "layer_norm",
         activation_func: str = "geglu",
         skip_checkpointing_layers: int = 0,
+        use_random_drop: bool = False,
+        use_pixel_decoder: bool = False,
     ):
         # Prevent base constructor block initialization
         nn.Module.__init__(self)
@@ -542,9 +537,13 @@ class SprintDualStreamDiT(DualStreamDiT):
         self.cfg_mask_prob = cfg_mask_prob
         self.use_rope_text_adapter = use_rope_text_adapter
         self.skip_checkpointing_layers = skip_checkpointing_layers
-        
+        self.use_random_drop = use_random_drop
+        self.use_pixel_decoder = use_pixel_decoder
+
         def should_checkpoint(layer_idx: int) -> bool:
-            return self.use_checkpointing and (layer_idx >= self.skip_checkpointing_layers)
+            return self.use_checkpointing and (
+                layer_idx >= self.skip_checkpointing_layers
+            )
 
         current_layer_idx = 0
 
@@ -611,7 +610,6 @@ class SprintDualStreamDiT(DualStreamDiT):
         )
         current_layer_idx += self.middle_depth
 
-
         # Decoder blocks
         out_start_idx = current_layer_idx
         self.out_blocks = nn.ModuleList(
@@ -630,13 +628,23 @@ class SprintDualStreamDiT(DualStreamDiT):
         current_layer_idx += self.decoder_depth
 
         self.norm_final = nn.RMSNorm(hidden_size, eps=eps)
-        self.proj_out = nn.Linear(hidden_size, patch_size * patch_size * out_channels)
+        if self.use_pixel_decoder:
+            self.pixel_decoder = LocalDecoder(
+                in_channels=in_channels,
+                out_channels=out_channels,
+                cond_hidden_size=hidden_size,
+            )
+            self.proj_out = None
+        else:
+            self.pixel_decoder = None
+            self.proj_out = nn.Linear(
+                hidden_size, patch_size * patch_size * out_channels
+            )
+            self._zero_initialize_output()
 
         # torch compile squeezes during bw so remove dims
         self.mask_token_image = nn.Parameter(torch.zeros(self.hidden_size))
         self.mask_token_text = nn.Parameter(torch.zeros(self.hidden_size))
-        torch.nn.init.normal_(self.mask_token_image, std=0.02)
-        torch.nn.init.normal_(self.mask_token_text, std=0.02)
 
         if self.residual_type == "concat_linear":
             self.renoise_linear_image = nn.Linear(
@@ -648,10 +656,32 @@ class SprintDualStreamDiT(DualStreamDiT):
             nn.init.zeros_(self.renoise_linear_image.bias)
             nn.init.zeros_(self.renoise_linear_text.bias)
 
-        self._zero_initialize_output()
+        # Freeze dead text path in the final decoder block (output is discarded)
+        if len(self.out_blocks) > 0:
+            last_block = self.out_blocks[-1]
+            for p in last_block.attn.proj_text.parameters():
+                p.requires_grad = False
+            for p in last_block.mlp_text.parameters():
+                p.requires_grad = False
+
+        # Freeze unused drop parameters based on drop_target
+        if self.drop_target not in ["text", "both"]:
+            self.mask_token_text.requires_grad = False
+            if hasattr(self, "renoise_linear_text"):
+                for p in self.renoise_linear_text.parameters():
+                    p.requires_grad = False
+
+        if self.drop_target not in ["image", "both"]:
+            self.mask_token_image.requires_grad = False
+            if hasattr(self, "renoise_linear_image"):
+                for p in self.renoise_linear_image.parameters():
+                    p.requires_grad = False
+
+        torch.nn.init.normal_(self.mask_token_image, std=0.02)
+        torch.nn.init.normal_(self.mask_token_text, std=0.02)
 
     def _drop_tokens(self, tokens, freqs, h_patches=None, w_patches=None):
-        if h_patches is not None and w_patches is not None:
+        if not self.use_random_drop and h_patches is not None and w_patches is not None:
             (
                 tokens_sparse,
                 ids_keep,
@@ -857,9 +887,4 @@ class SprintDualStreamDiT(DualStreamDiT):
                 skip=skip_tensors,
             )
 
-        tokens = self.proj_out(self.norm_final(image_tokens))
-
-        tokens = tokens.reshape(bsz, h_patches, w_patches, p, p, self.out_channels)
-        tokens = tokens.permute(0, 5, 1, 3, 2, 4).reshape(bsz, self.out_channels, H, W)
-
-        return tokens
+        return self._decode_output(image_tokens, x, bsz, h_patches, w_patches, p, H, W)

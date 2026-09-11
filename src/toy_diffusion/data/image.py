@@ -13,7 +13,7 @@ from toy_diffusion.data.tokenizer import (
     HFLLMTokenizer,
 )
 
-IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".gif", ".webp"}
+IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".avif"}
 
 
 class TieredBatchSampler(Sampler):
