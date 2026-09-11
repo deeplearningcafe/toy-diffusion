@@ -12,6 +12,7 @@ from toy_diffusion.trainer import Trainer
 from toy_diffusion.data.image import ImageDataset, TieredBatchSampler
 from toy_diffusion.utils.logging_utils import Logger
 from toy_diffusion.utils.evaluation_utils import evaluate_model
+from toy_diffusion.utils.trainer_utils import load_latent_to_pixel_weights
 
 
 def run_anime_faces_experiment(args):
@@ -34,6 +35,17 @@ def run_anime_faces_experiment(args):
         "device": device,
     }
 
+    is_pixel_training = config.get("is_pixel_training", False)
+    if is_pixel_training:
+        logging.info("--> Activating PIXEL-SPACE adaptation mode <--")
+        config["is_latents"] = False
+        config["use_pixel_decoder"] = True
+        config["patch_size"] = 16
+        config["in_channels"] = 3
+        config["out_channels"] = 3
+        # x-prediction strictly outperforms v-prediction
+        # config["loss_target"] = "v"
+        # config["prediction_target"] = "x"
     timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     save_dir = f"results/images/{timestamp}"
     Logger.setup_logging(
@@ -117,8 +129,16 @@ def run_anime_faces_experiment(args):
     data_shape = list(dataset[0][0].shape if is_conditional else dataset[0].shape)
     logging.info(f"Image Shape: {data_shape}")
 
+    # Prevent Trainer from doing strict resume when adapting latent weights
+    latent_checkpoint = config.pop("latent_checkpoint", None)
+    if is_pixel_training and latent_checkpoint:
+        config["resume_from_checkpoint"] = None
+
     pred_target = config["loss_target"]
     trainer = Trainer(config, prediction_target=pred_target, dataset=dataset)
+
+    if is_pixel_training and latent_checkpoint:
+        load_latent_to_pixel_weights(trainer.model, latent_checkpoint)
 
     trainer.train(
         config["epochs"],

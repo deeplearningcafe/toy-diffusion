@@ -67,7 +67,7 @@ class ImageDataset(Dataset):
 
     def __init__(
         self,
-        root_dir: str | Path,
+        root_dir: str | Path | list[str | Path],
         dtype=torch.float32,
         num_workers: int = 4,
         resize_dim: int = None,
@@ -87,7 +87,18 @@ class ImageDataset(Dataset):
         tiers_len: list = None,
         tokenizer: BaseTokenizer | str | None = None,
     ) -> None:
-        self.root_dir = Path(root_dir)
+        if isinstance(root_dir, (list, tuple)):
+            self.root_dirs = [Path(r) for r in root_dir]
+            for r in self.root_dirs:
+                if not r.is_dir():
+                    raise NotADirectoryError(f"Root dir not found: {r}")
+            self.root_dir = self.root_dirs[0]
+        else:
+            self.root_dir = Path(root_dir)
+            if not self.root_dir.is_dir():
+                raise NotADirectoryError(f"Root dir not found: {self.root_dir}")
+            self.root_dirs = [self.root_dir]
+
         self.num_workers = num_workers
         self.load_into_ram = load_into_ram
         self.conditional = conditional
@@ -120,9 +131,6 @@ class ImageDataset(Dataset):
         if self.compute_normalization and self.is_latents:
             self.vae_scale = 1.0
             self.vae_shift = 0.0
-
-        if not self.root_dir.is_dir():
-            raise NotADirectoryError(f"H5 root directory not found: {self.root_dir}")
 
         if not self.is_latents:
             # they support cuda, so we could transform to tensor and operate on cuda
@@ -175,9 +183,12 @@ class ImageDataset(Dataset):
         return self.tokenizer.vocab
 
     def _scan_directory_images(self):
-        return [
-            p for p in self.root_dir.rglob("*") if p.suffix.lower() in IMAGE_SUFFIXES
-        ]
+        paths = []
+        for r in self.root_dirs:
+            paths.extend(
+                [p for p in r.rglob("*") if p.suffix.lower() in IMAGE_SUFFIXES]
+            )
+        return paths
 
     def _get_prompt(self, p: Path) -> str:
         """Helper to read text prompt for a given file path."""

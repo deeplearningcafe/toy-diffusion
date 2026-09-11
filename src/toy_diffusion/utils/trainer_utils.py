@@ -48,6 +48,7 @@ def get_model(config, device):
     text_enc = None
     cross_attention_dim = config.get("cross_attention_dim", None)
     use_pixel_decoder = config.get("use_pixel_decoder", False)
+    patch_size = config.get("patch_size", 2)
 
     if config.get("is_conditional", False):
         hf_model_id = config.get("hf_text_encoder", None)
@@ -138,6 +139,7 @@ def get_model(config, device):
         unet = DualStreamDiT(
             in_channels=in_channels,
             out_channels=in_channels,
+            patch_size=patch_size,
             hidden_size=config["hidden_dim"],
             num_heads=config.get("num_heads", 12),
             text_embed_dim=cross_attention_dim,
@@ -160,6 +162,7 @@ def get_model(config, device):
         unet = LuminaNextDit(
             in_channels=in_channels,
             out_channels=in_channels,
+            patch_size=patch_size,
             hidden_size=config["hidden_dim"],
             num_attention_heads=config.get("num_heads", 12),
             num_kv_heads=config.get("num_kv_heads", 4),
@@ -186,6 +189,7 @@ def get_model(config, device):
             unet = SprintLuminaNextDit(
                 in_channels=in_channels,
                 out_channels=in_channels,
+                patch_size=patch_size,
                 hidden_size=config["hidden_dim"],
                 num_attention_heads=config.get("num_heads", 12),
                 num_kv_heads=config.get("num_kv_heads", 4),
@@ -207,6 +211,7 @@ def get_model(config, device):
             unet = SprintDualStreamDiT(
                 in_channels=in_channels,
                 out_channels=in_channels,
+                patch_size=patch_size,
                 hidden_size=config["hidden_dim"],
                 depth=config["depth"],
                 num_heads=config.get("num_heads", 12),
@@ -490,3 +495,55 @@ def get_vae(config, device, dtype=torch.bfloat16):
     vae.requires_grad_(False)
 
     return vae
+
+
+def load_latent_to_pixel_weights(model: nn.Module, checkpoint_dir: str):
+    """
+    Transfers Transformer backbone and conditioning weights from a latent
+    checkpoint to a pixel DiT, leaving patch embedding and DiP decoder to train.
+    """
+    ckpt_path = Path(checkpoint_dir)
+    if ckpt_path.is_dir():
+        candidates = ["model.pt", "checkpoint.pt", "ema_model.pt"]
+        ckpt_file = None
+        for c in candidates:
+            if (ckpt_path / c).exists():
+                ckpt_file = ckpt_path / c
+                break
+        if ckpt_file is None:
+            pt_files = list(ckpt_path.glob("*.pt"))
+            if pt_files:
+                ckpt_file = pt_files[0]
+    else:
+        ckpt_file = ckpt_path
+
+    if ckpt_file is None or not ckpt_file.exists():
+        raise FileNotFoundError(f"No checkpoint file found at {checkpoint_dir}")
+
+    logging.info(f"Transferring latent priors from {ckpt_file}...")
+    state_dict = torch.load(ckpt_file, map_location="cpu", weights_only=False)
+    if "model" in state_dict:
+        state_dict = state_dict["model"]
+    elif "ema_model" in state_dict:
+        state_dict = state_dict["ema_model"]
+
+    target_state = model.state_dict()
+    filtered_dict = {}
+    skipped_keys = []
+
+    for k, v in state_dict.items():
+        clean_k = k[len("_orig_mod.") :] if k.startswith("_orig_mod.") else k
+        if clean_k in target_state:
+            if target_state[clean_k].shape == v.shape:
+                filtered_dict[clean_k] = v
+            else:
+                skipped_keys.append((clean_k, "shape mismatch"))
+        else:
+            skipped_keys.append((clean_k, "not in target model"))
+
+    missing, unexpected = model.load_state_dict(filtered_dict, strict=False)
+    logging.info(
+        f"Transferred {len(filtered_dict)} layers from latent checkpoint. "
+        f"Skipped {len(skipped_keys)} mismatched layers (e.g. input/output heads)."
+        f"Skipped {skipped_keys}"
+    )
