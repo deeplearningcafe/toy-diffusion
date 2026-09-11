@@ -232,8 +232,16 @@ def get_model(config, device):
                 "G": DDGANGenerator(
                     data_dim=config.get("projection_dim", 2),
                     latent_dim=config.get("latent_dim", 4),
+                    hidden_dim=config.get("hidden_dim", 256),
+                    time_embed_dim=config.get("time_embed_dim", 64),
+                    use_skip=config.get("ddgan_use_skip", False),
                 ),
-                "D": DDGANDiscriminator(data_dim=config.get("projection_dim", 2)),
+                "D": DDGANDiscriminator(
+                    data_dim=config.get("projection_dim", 2),
+                    hidden_dim=config.get("hidden_dim", 256),
+                    time_embed_dim=config.get("time_embed_dim", 64),
+                    out_dim=config.get("ddgan_out_dim", 1),
+                ),
             }
         ).to(device)
     else:
@@ -257,7 +265,11 @@ def get_schedule_loss(config, model, prediction_target, device):
         print("Using dd-gan scheduler and loss")
         schedule = DDPMSchedule(device=device)
         loss_fn = DDGANLoss(
-            schedule=schedule, num_timesteps=config.get("ddgan_steps", 4)
+            schedule=schedule,
+            num_timesteps=config.get("ddgan_steps", 4),
+            r1_gamma=config.get("r1_gamma", 0.05),
+            loss_type=config.get("ddgan_loss_type", "softplus"),
+            ac_w=config.get("ac_w", 0.0),
         )
         return schedule, loss_fn, model
 
@@ -356,10 +368,16 @@ def create_optim_scheduler(
 ):
     if conf.get("model_type") == "ddgan":
         optimizer_g = torch.optim.Adam(
-            model["G"].parameters(), lr=conf.get("lr", 1e-4), betas=(0.5, 0.9)
+            model["G"].parameters(),
+            lr=conf.get("lr", 1e-4) / 2.0,
+            betas=(0.5, 0.9),
+            fused=True,
         )
         optimizer_d = torch.optim.Adam(
-            model["D"].parameters(), lr=conf.get("lr", 1e-4), betas=(0.5, 0.9)
+            model["D"].parameters(),
+            lr=conf.get("lr", 1e-4),
+            betas=(0.5, 0.9),
+            fused=True,
         )
         return {"G": optimizer_g, "D": optimizer_d}, None
 
@@ -383,7 +401,7 @@ def create_optim_scheduler(
 
     scheduler = None
     # if decay phase of wsd we need to change the steps
-    total_steps = (conf["epochs"]-start_epoch) * len_train_loader
+    total_steps = (conf["epochs"] - start_epoch) * len_train_loader
     warmup_steps = int(conf.get("warmup", 0.02) * total_steps)
     warmup_steps = 0 if skip_warmup else warmup_steps
     warmup_steps = min(warmup_steps, total_steps - 1) if total_steps > 0 else 0

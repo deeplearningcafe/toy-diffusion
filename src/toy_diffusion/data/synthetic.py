@@ -196,6 +196,21 @@ class SyntheticDataset(Dataset):
 
             return x.astype(np.float32)
 
+        elif name == "gmm_grid":
+            # 25 Gaussians in a 5x5 grid (DD-GAN Figure 6 benchmark)
+            grid_vals = np.linspace(-2.0, 2.0, 5)
+            grid_x, grid_y = np.meshgrid(grid_vals, grid_vals)
+            centers = np.stack([grid_x.ravel(), grid_y.ravel()], axis=1)
+
+            indices = np.random.choice(len(centers), n_samples)
+            # Standard deviation relative to mode spacing (20:1 ratio)
+            noise = np.random.randn(n_samples, 2) * 0.05
+            x = centers[indices] + noise
+
+            # Standardize to zero mean and unit variance for diffusion
+            x = (x - x.mean(0)) / x.std(0)
+            return x.astype(np.float32)
+
         elif name == "kanji":
             return self._generate_kanji_data("あ", n_samples, font_path, size=512)
 

@@ -1,4 +1,5 @@
 import torch
+import torch.nn as nn
 import numpy as np
 from tqdm.auto import tqdm
 from datetime import datetime
@@ -69,6 +70,17 @@ class Trainer:
         )
         self.grad_clip = self.config.get("grad_clip", 1.0)
         self.is_latents = self.config.get("is_latents", False)
+
+        # detect synthetic/2D dataset
+        self.synthetic_data = self.config.get(
+            "synthetic_data", self.config.get("is_synthetic", None)
+        )
+        if self.synthetic_data is None:
+            sample_data = self.dataset[0]
+            if isinstance(sample_data, (tuple, list)):
+                sample_data = sample_data[0]
+            self.synthetic_data = sample_data.ndim == 1
+
         self.gradient_accumulation_steps = self.config.get(
             "gradient_accumulation_steps", 1
         )
@@ -136,10 +148,9 @@ class Trainer:
         self.start_epoch = 0
         resume_dir = config.get("resume_from_checkpoint", None)
         if resume_dir is not None:
-            ignore_scheduler = (
-                self.config.get("ignore_checkpoint_scheduler", False)
-                or not self.config.get("use_scheduler", True)
-            )
+            ignore_scheduler = self.config.get(
+                "ignore_checkpoint_scheduler", False
+            ) or not self.config.get("use_scheduler", True)
             self.start_epoch, ckpt_cfg, ckpt_vocab = load_from_checkpoint(
                 checkpoint_dir=resume_dir,
                 model=self.model,
@@ -177,11 +188,16 @@ class Trainer:
                 if self.ema.ema_model is None:
                     self.ema.initialize(self.model)
 
-        self.patch_size = getattr(self.model["unet"], "patch_size", 2)
-        self.num_params = self.model["unet"].get_params()
+        self.patch_size = 2
+        self.num_params = 0
+        if isinstance(self.model, (dict, nn.ModuleDict)) and "unet" in self.model:
+            self.patch_size = getattr(self.model["unet"], "patch_size", 2)
+            self.num_params = self.model["unet"].get_params()
         self.peak_tflops = self.config.get("gpu_peak_tflops", 165.2)
         # normally 8 is used but as attention is not recomputed we will use 7
-        self.factor = 6 if not self.config.get("use_gradient_checkpointing", False) else 7
+        self.factor = (
+            6 if not self.config.get("use_gradient_checkpointing", False) else 7
+        )
 
         if config.get("use_gradient_checkpointing", False):
             patch_unsloth_smart_gradient_checkpointing(dtype=torch.bfloat16)
@@ -205,7 +221,11 @@ class Trainer:
                         self.model["text_enc"].model
                     )
             else:
-                self.model = torch.compile(self.model)
+                if not self.config.get("model_type") == "ddgan":
+                    self.model = torch.compile(self.model)
+                else:
+                    self.model["G"] = torch.compile(self.model["G"])
+                    self.model["D"] = torch.compile(self.model["D"])
 
             if self.vae is not None:
                 self.vae = torch.compile(self.vae)
@@ -240,8 +260,8 @@ class Trainer:
             prompt = (prompt_tokens, prompt_mask)
         else:
             # Handle Tuple Batches (Reflow)
-            if isinstance(x, (list, tuple)):
-                x = [b.to(self.device, non_blocking=True).float() for b in x]
+            if isinstance(batch, (list, tuple)):
+                x = [b.to(self.device, non_blocking=True).float() for b in batch]
             else:
                 x = batch.to(self.device, non_blocking=True).float()
 
@@ -286,7 +306,8 @@ class Trainer:
         """
         self.model.train()
         total_loss = torch.tensor([0.0], device=self.device)
-        self.optimizer.zero_grad(set_to_none=True)
+        if not self.config.get("model_type") == "ddgan":
+            self.optimizer.zero_grad(set_to_none=True)
 
         total_images = 0
         total_tokens = 0
@@ -373,7 +394,6 @@ class Trainer:
 
                 self.ema.update(self.model)
 
-        
         if use_cuda:
             t_end.record()
             torch.cuda.synchronize()
@@ -455,12 +475,13 @@ class Trainer:
                     f"LR: {lr_val:.3e}"
                 )
 
-            if (epoch + 1) % sample_interval == 0 or (epoch + 1) == epochs:
+            if not self.synthetic_data and (
+                (epoch + 1) % sample_interval == 0 or (epoch + 1) == epochs
+            ):
                 self.run_sampling(timestamp, epoch, num_steps)
 
-            if (
-                save_interval > 0
-                and (epoch + 1) % save_interval == 0
+            if not self.synthetic_data and (
+                (save_interval > 0 and (epoch + 1) % save_interval == 0)
                 or (epoch + 1) == epochs
             ):
                 vocab = getattr(self.dataset, "vocab", None)
@@ -524,10 +545,10 @@ class Trainer:
 
         if data_shape is None:
             if hasattr(self.dataset, "P"):
-                D = self.dataset[0].shape[-1]
+                D = self.dataset[0].shape
                 # Reflow dataset
                 if isinstance(self.dataset[0], (tuple, list)):
-                    D = self.dataset[0][0].shape[-1]
+                    D = list(self.dataset[0][0].shape[-1])
             else:
                 # Image self.dataset
                 if isinstance(self.dataset[0], (tuple, list)):
@@ -589,6 +610,7 @@ class Trainer:
                     is_conditional=self.conditional,
                     projection_matrix=projection_matrix,
                     return_traj=return_traj or force_traj,
+                    device=self.device,
                     vae=self.vae,
                     vae_scale=self.config.get("vae_scale", 1.0),
                     vae_shift=self.config.get("vae_shift", 0.0),

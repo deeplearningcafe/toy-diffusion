@@ -209,9 +209,17 @@ class DDGANGenerator(nn.Module):
     The latent z enables modeling multimodal denoising distributions.
     """
 
-    def __init__(self, data_dim=2, latent_dim=4, hidden_dim=256, time_embed_dim=64):
+    def __init__(
+        self,
+        data_dim=2,
+        latent_dim=4,
+        hidden_dim=256,
+        time_embed_dim=64,
+        use_skip=False,
+    ):
         super().__init__()
         self.latent_dim = latent_dim
+        self.use_skip = use_skip
         self.time_mlp = TimeEmbedding(time_embed_dim)
 
         self.fc1 = nn.Linear(data_dim + latent_dim, hidden_dim)
@@ -223,6 +231,10 @@ class DDGANGenerator(nn.Module):
         self.t2 = nn.Linear(time_embed_dim, hidden_dim)
         self.t3 = nn.Linear(time_embed_dim, hidden_dim)
 
+        # Skip connection layer concatenating decode output and noisy input xt
+        if self.use_skip:
+            self.out = nn.Linear(data_dim * 2, data_dim)
+
     def forward(self, x, t, z=None):
         if z is None:
             z = torch.randn(x.shape[0], self.latent_dim, device=x.device)
@@ -232,7 +244,11 @@ class DDGANGenerator(nn.Module):
         h = torch.nn.functional.silu(self.fc1(h) + self.t1(t_emb))
         h = torch.nn.functional.silu(self.fc2(h) + self.t2(t_emb))
         h = torch.nn.functional.silu(self.fc3(h) + self.t3(t_emb))
-        return self.fc4(h)
+        out = self.fc4(h)
+
+        if self.use_skip:
+            out = self.out(torch.cat([out, x], dim=1))
+        return out
 
 
 class DDGANDiscriminator(nn.Module):
@@ -241,14 +257,20 @@ class DDGANDiscriminator(nn.Module):
     denoising steps conditioned on the noisier state x_curr and time t.
     """
 
-    def __init__(self, data_dim=2, hidden_dim=256, time_embed_dim=64):
+    def __init__(
+        self,
+        data_dim=2,
+        hidden_dim=256,
+        time_embed_dim=64,
+        out_dim=1,
+    ):
         super().__init__()
         self.time_mlp = TimeEmbedding(time_embed_dim)
 
         self.fc1 = nn.Linear(data_dim * 2, hidden_dim)
         self.fc2 = nn.Linear(hidden_dim, hidden_dim)
         self.fc3 = nn.Linear(hidden_dim, hidden_dim)
-        self.fc4 = nn.Linear(hidden_dim, 1)
+        self.fc4 = nn.Linear(hidden_dim, out_dim)
 
         self.t1 = nn.Linear(time_embed_dim, hidden_dim)
         self.t2 = nn.Linear(time_embed_dim, hidden_dim)

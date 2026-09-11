@@ -5,6 +5,7 @@ import os
 import logging
 import concurrent.futures
 from PIL import Image
+import scipy.stats as stats
 from toy_diffusion.paths.sampling import generate_samples
 from toy_diffusion.evaluation import (
     compute_precision_recall,
@@ -90,6 +91,7 @@ def visualize_flow_matching(
     num_samples: int = 2048,
     num_timesteps: int = 50,
     clip_prediction: bool = False,
+    use_kde_plots: bool = False,
 ):
     """
     Visualizes the Learned Model ODE vs Ground Truth Conditional Paths.
@@ -256,7 +258,7 @@ def visualize_flow_matching(
     logging.info(f"\n--- Evaluation Metrics for {save_path} ---")
 
     # traj is (B, Steps, 2)
-    curvature = compute_curvature(traj)
+    curvature = compute_curvature(traj[:4096])
     logging.info(f"  > Path Curvature: {curvature:.4f} (1.0 = Straight)")
 
     # B. Trajectory Chamfer Distance
@@ -277,12 +279,14 @@ def visualize_flow_matching(
     # Stack to (B, Steps, 2)
     gt_traj = np.stack(gt_traj_list, axis=1)
 
-    chamfer_traj = chamfer_distance(traj, gt_traj, is_trajectory=True)
+    chamfer_traj = chamfer_distance(traj[:4096], gt_traj[:4096], is_trajectory=True)
     logging.info(f"  > Trajectory Chamfer Distance: {chamfer_traj:.4f}")
 
     if "gmm" in dataset_name or "pinwheel" in dataset_name:
         k = 8 if dataset_name == "gmm" else 5
-        precision, recall = compute_precision_recall(samples_final, gt_2d, k=k)
+        precision, recall = compute_precision_recall(
+            samples_final[:4096], gt_2d[:4096], k=k
+        )
         logging.info(f"  > Manifold Precision: {precision:.4f}")
         logging.info(f"  > Manifold Recall:    {recall:.4f}")
     else:
@@ -295,15 +299,28 @@ def visualize_flow_matching(
     ax.set_title("Samples from Learned Marginal ODE", fontsize=28)
     plot_background(ax)
 
-    # Plot intermediate distributions
-    indices = [0, num_timesteps // 2, num_timesteps]
+    if use_kde_plots:
+        plot_kde_density(
+            ax,
+            samples_final,
+            x_bounds=x_bounds,
+            y_bounds=y_bounds,
+            cmap="Blues",
+        )
+    else:
+        # Plot intermediate distributions
+        indices = [0, num_timesteps // 2, num_timesteps]
 
-    for idx, t_val, color in zip(indices, time_steps, time_colors):
-        idx = min(idx, traj.shape[1] - 1)
-        pts = traj[:, idx, :]
-        ax.scatter(pts[:, 0], pts[:, 1], s=15, alpha=0.6, c=color, label=f"t={t_val}")
+        for idx, t_val, color in zip(indices, time_steps, time_colors):
+            idx = min(idx, traj.shape[1] - 1)
+            pts = traj[:, idx, :]
+            ax.scatter(
+                pts[:, 0], pts[:, 1], s=15, alpha=0.6, c=color, label=f"t={t_val}"
+            )
 
-    ax.legend(prop={"size": legend_size}, loc="upper right", markerscale=markerscale)
+        ax.legend(
+            prop={"size": legend_size}, loc="upper right", markerscale=markerscale
+        )
 
     # Plot 3: Trajectories of Learned Marginal ODE
     ax = axes[1, 1]
@@ -644,6 +661,7 @@ def visualize_step_comparison(
     perturb_t: float = None,
     perturb_scale: float = 0.0,
     clip_prediction: bool = False,
+    use_kde_plots: bool = False,
 ):
     """
     Creates a grid visualization comparing models (rows) across different
@@ -744,47 +762,58 @@ def visualize_step_comparison(
                 **extra_kwargs,
             )
 
-            # Plot Baseline (Blue, Background)
-            alpha_base = 0.3 if (perturb_t is not None and supports_perturb) else 0.5
-            ax.scatter(
-                samples_base[:, 0],
-                samples_base[:, 1],
-                s=1,
-                alpha=alpha_base,
-                c="royalblue",
-                label="Base",
-            )
-
-            # 2. Perturbed Sampling
-            if perturb_t is not None and supports_perturb:
-                samples_perturb = generate_samples(
-                    model=trainer.model,
-                    schedule=trainer.schedule,
-                    batch_size=num_samples,
-                    data_shape=(D,),
-                    diffusion_type=diffusion_type,
-                    prediction_target=trainer.prediction_target,
-                    num_steps=n_steps,
-                    is_conditional=is_conditional,
-                    embeddings=embeddings,
-                    attention_mask=attention_mask,
-                    projection_matrix=P,
-                    return_traj=False,
-                    device=device,
-                    perturb_t=perturb_t,
-                    perturb_scale=perturb_scale,
-                    **extra_kwargs,
+            if use_kde_plots:
+                plot_kde_density(
+                    ax,
+                    samples_base,
+                    x_bounds=xlims,
+                    y_bounds=ylims,
+                    cmap="Blues",
                 )
-
-                # Plot Perturbed (Red, Foreground)
+            else:
+                # Plot Baseline (Blue, Background)
+                alpha_base = (
+                    0.3 if (perturb_t is not None and supports_perturb) else 0.5
+                )
                 ax.scatter(
-                    samples_perturb[:, 0],
-                    samples_perturb[:, 1],
+                    samples_base[:, 0],
+                    samples_base[:, 1],
                     s=1,
-                    alpha=0.45,
-                    c="tomato",
-                    label="Perturbed",
+                    alpha=alpha_base,
+                    c="royalblue",
+                    label="Base",
                 )
+
+                # 2. Perturbed Sampling
+                if perturb_t is not None and supports_perturb:
+                    samples_perturb = generate_samples(
+                        model=trainer.model,
+                        schedule=trainer.schedule,
+                        batch_size=num_samples,
+                        data_shape=(D,),
+                        diffusion_type=diffusion_type,
+                        prediction_target=trainer.prediction_target,
+                        num_steps=n_steps,
+                        is_conditional=is_conditional,
+                        embeddings=embeddings,
+                        attention_mask=attention_mask,
+                        projection_matrix=P,
+                        return_traj=False,
+                        device=device,
+                        perturb_t=perturb_t,
+                        perturb_scale=perturb_scale,
+                        **extra_kwargs,
+                    )
+
+                    # Plot Perturbed (Red, Foreground)
+                    ax.scatter(
+                        samples_perturb[:, 0],
+                        samples_perturb[:, 1],
+                        s=1,
+                        alpha=0.45,
+                        c="tomato",
+                        label="Perturbed",
+                    )
 
             ax.set_xlim(xlims)
             ax.set_ylim(ylims)
@@ -927,6 +956,7 @@ def visualize_cm_evolution(
     num_steps=4,
     device="cuda",
     dataset_name="unknown",
+    use_kde_plots: bool = False,
 ):
     """
     Visualizes the evolution of the predicted x0 and xt for different NFE steps.
@@ -945,9 +975,9 @@ def visualize_cm_evolution(
         isinstance(model, (dict, torch.nn.ModuleDict)) and "text_enc" in model
     )
     embeddings, attention_mask = None, None
-    if is_conditional:
-        with torch.no_grad():
-            embeddings, attention_mask = trainer.model["text_enc"]([""] * num_samples)
+    # if is_conditional:
+    #     with torch.no_grad():
+    #         embeddings, attention_mask = trainer.model["text_enc"]([""] * num_samples)
 
     final_samples, (traj_xt, traj_x0, t_steps) = generate_samples(
         model=model,
@@ -968,14 +998,18 @@ def visualize_cm_evolution(
     logging.info(f"\n--- Evaluation Metrics for {save_path} ---")
 
     # Chamfer Distance (Distribution match, not trajectory)
-    chamfer_dist = chamfer_distance(final_samples, gt_2d, is_trajectory=False)
+    chamfer_dist = chamfer_distance(
+        final_samples[:4096], gt_2d[:4096], is_trajectory=False
+    )
     logging.info(f"  > Distribution Chamfer Distance: {chamfer_dist:.4f}")
 
     # Precision & Recall (Only for GMM / Pinwheel)
     dataset_name_lower = dataset_name.lower()
     if "gmm" in dataset_name_lower or "pinwheel" in dataset_name_lower:
         k = 8 if "gmm" in dataset_name_lower else 5
-        precision, recall = compute_precision_recall(final_samples, gt_2d, k=k)
+        precision, recall = compute_precision_recall(
+            final_samples[:4096], gt_2d[:4096], k=k
+        )
         logging.info(f"  > Manifold Precision: {precision:.4f}")
         logging.info(f"  > Manifold Recall:    {recall:.4f}")
     else:
@@ -1006,39 +1040,48 @@ def visualize_cm_evolution(
 
     for i in range(num_steps):
         ax = axes[i]
-
-        idx = np.random.choice(len(gt_2d), min(2000, len(gt_2d)), replace=False)
-        ax.scatter(
-            gt_2d[idx, 0],
-            gt_2d[idx, 1],
-            s=10,
-            c="lightgray",
-            alpha=0.35 if not is_imbalanced else 0.5,
-            label="Data (GT)",
-        )
-
-        # Plot xt (Noisy State)
-        # we scale it by c_in
-        t_curr = t_steps[i]
-        sigma_data = 0.5  # Standard for CM/EDM
-        c_in = 1.0 / np.sqrt(t_curr**2 + sigma_data**2)
-
-        xt = traj_xt[:, i, :]
-        xt_scaled = xt * c_in
-        ax.scatter(
-            xt_scaled[:, 0],
-            xt_scaled[:, 1],
-            s=10,
-            c="tomato",
-            alpha=0.4,
-            label="c_{in} * x_t (Scaled Noisy)",
-        )
-
-        # Plot x0 (Predicted Data)
         x0 = traj_x0[:, i, :]
-        ax.scatter(
-            x0[:, 0], x0[:, 1], s=5, c="royalblue", alpha=0.5, label="Predicted x_0"
-        )
+
+        if use_kde_plots:
+            plot_kde_density(
+                ax,
+                x0,
+                x_bounds=xlims,
+                y_bounds=ylims,
+                cmap="Blues",
+            )
+        else:
+            idx = np.random.choice(len(gt_2d), min(2000, len(gt_2d)), replace=False)
+            ax.scatter(
+                gt_2d[idx, 0],
+                gt_2d[idx, 1],
+                s=10,
+                c="lightgray",
+                alpha=0.35 if not is_imbalanced else 0.5,
+                label="Data (GT)",
+            )
+
+            # Plot xt (Noisy State)
+            # we scale it by c_in
+            t_curr = t_steps[i]
+            sigma_data = 0.5  # Standard for CM/EDM
+            c_in = 1.0 / np.sqrt(t_curr**2 + sigma_data**2)
+
+            xt = traj_xt[:, i, :]
+            xt_scaled = xt * c_in
+            ax.scatter(
+                xt_scaled[:, 0],
+                xt_scaled[:, 1],
+                s=10,
+                c="tomato",
+                alpha=0.4,
+                label="c_{in} * x_t (Scaled Noisy)",
+            )
+
+            # Plot x0 (Predicted Data)
+            ax.scatter(
+                x0[:, 0], x0[:, 1], s=5, c="royalblue", alpha=0.5, label="Predicted x_0"
+            )
 
         ax.set_title(f"Step {i + 1} (NFE={i + 1})", fontsize=28)
         ax.set_xlim(xlims)
@@ -1111,3 +1154,63 @@ def visualize_long_tail_histogram(
     plt.close()
 
     logging.info(f"Saved long tail histogram to {save_path}")
+
+
+def plot_kde_density(
+    ax,
+    data_2d,
+    x_bounds=None,
+    y_bounds=None,
+    cmap="Blues",
+    grid_res=150,
+    thresh=0.05,
+    levels_num=10,
+    max_kde_points=5000,
+):
+    """
+    Computes and plots a 2D Kernel Density Estimation contour using Scipy.
+    Emulates sns.kdeplot(fill=True, thresh=thresh, cmap=cmap) without
+    introducing a Seaborn dependency.
+    """
+    if isinstance(data_2d, torch.Tensor):
+        data_2d = data_2d.detach().cpu().numpy()
+
+    x = data_2d[:, 0]
+    y = data_2d[:, 1]
+
+    # Guard against zero-variance / collapsed distributions
+    if np.isclose(x.std(), 0.0) or np.isclose(y.std(), 0.0):
+        return
+
+    # Subsample for fast evaluation if point count is large
+    if len(x) > max_kde_points:
+        idx = np.random.choice(len(x), max_kde_points, replace=False)
+        x, y = x[idx], y[idx]
+
+    positions = np.vstack([x, y])
+    try:
+        kernel = stats.gaussian_kde(positions)
+    except np.linalg.LinAlgError:
+        return
+
+    if x_bounds is None:
+        x_min, x_max = x.min() - 0.5, x.max() + 0.5
+    else:
+        x_min, x_max = x_bounds
+
+    if y_bounds is None:
+        y_min, y_max = y.min() - 0.5, y.max() + 0.5
+    else:
+        y_min, y_max = y_bounds
+
+    X, Y = np.meshgrid(
+        np.linspace(x_min, x_max, grid_res),
+        np.linspace(y_min, y_max, grid_res),
+    )
+    positions_grid = np.vstack([X.ravel(), Y.ravel()])
+    Z = kernel(positions_grid).reshape(X.shape)
+
+    z_max = Z.max()
+    if z_max > 0.0:
+        levels = np.linspace(z_max * thresh, z_max, levels_num)
+        ax.contourf(X, Y, Z, levels=levels, cmap=cmap)

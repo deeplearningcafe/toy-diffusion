@@ -156,9 +156,7 @@ class GeneralDiffusionLoss(nn.Module):
         B = data.shape[0]
         data_flat = data.view(B, -1)
         eps_flat = eps.view(B, -1)
-        _, (row_idx, col_idx) = euclidean_optimal_transport(
-            data_flat, eps_flat
-        )
+        _, (row_idx, col_idx) = euclidean_optimal_transport(data_flat, eps_flat)
         eps_sorted = torch.empty_like(eps)
         eps_sorted[row_idx] = eps[col_idx]
         return eps_sorted
@@ -230,17 +228,13 @@ class GeneralDiffusionLoss(nn.Module):
         B = data.shape[0]
         device = data.device
 
-        t = self.timestep_sampling_fn(
-            B, device, shift=self.train_shift
-        )
+        t = self.timestep_sampling_fn(B, device, shift=self.train_shift)
         t_view = t.view(-1, *([1] * (data.ndim - 1)))
 
         alpha, sigma, d_alpha, d_sigma = self.schedule.get_coefficients(t_view)
 
         if self.input_perturbation > 0.0:
-            noise_perturb = (
-                torch.randn_like(data) * self.input_perturbation
-            )
+            noise_perturb = torch.randn_like(data) * self.input_perturbation
             eps = eps + noise_perturb
 
         z_t = alpha * data + sigma * eps
@@ -297,6 +291,7 @@ class GeneralDiffusionLoss(nn.Module):
                 eps = self._compute_ot_eps(data, eps)
 
         return self._compiled_loss_step(model, data, eps, prompt)
+
 
 class EDMLoss(nn.Module):
     """
@@ -483,18 +478,35 @@ class ConsistencyTrainingLoss(nn.Module):
 
 class DDGANLoss(nn.Module):
     """
-    Computes the Non-Saturating GAN loss for DD-GAN with R1 regularization.
-    Returns both Discriminator and Generator losses.
+    Computes the GAN loss for DD-GAN with optional R1 regularization.
+    Supports non-saturating softplus loss and bounded BCE loss.
     """
 
-    def __init__(self, schedule, num_timesteps=4, r1_gamma=0.05):
+    def __init__(
+        self,
+        schedule,
+        num_timesteps=4,
+        r1_gamma=0.05,
+        loss_type="softplus",
+        ac_w=0.0,
+    ):
         super().__init__()
         self.schedule = schedule
         self.num_timesteps = num_timesteps
         self.r1_gamma = r1_gamma
+        self.loss_type = loss_type
+        self.ac_w = ac_w
 
-    def forward(self, model, x, prompt=None):
-        G, D = model["G"], model["D"]
+        if self.loss_type == "bce":
+            self._forward_impl = self._forward_bce
+        else:
+            self._forward_impl = self._forward_softplus
+
+    def _sample_diffusion_pairs(self, model, x):
+        """
+        Samples real diffused pairs (x_next, x_curr) and generator fake state.
+        """
+        G = model["G"]
         B, device = x.shape[0], x.device
 
         t_grid = torch.linspace(0, 1, self.num_timesteps + 1, device=device)
@@ -521,22 +533,11 @@ class DDGANLoss(nn.Module):
         eps_prime = torch.randn_like(x)
         x_curr = alpha_step * x_next + sigma_step * eps_prime
 
-        x_next = x_next.detach().requires_grad_(True)
-        D_real = D(x_next, x_curr.detach(), t_curr)
-        errD_real = torch.nn.functional.softplus(-D_real).mean()
-
-        # R1 Penalty
-        grad_real = torch.autograd.grad(
-            outputs=D_real.sum(), inputs=x_next, create_graph=True
-        )[0]
-        grad_pen = (grad_real.view(B, -1).norm(2, dim=1) ** 2).mean()
-        errD_real = errD_real + self.r1_gamma / 2 * grad_pen
-
         # Sample Fake Pairs using Generator and Posterior
         z = torch.randn(B, G.latent_dim, device=device)
         x_0_pred = G(x_curr, t_curr, z)
 
-        # q(x_next | x_curr, x_0_pred) mapping
+        # q(x_next | x_curr, x_0_pred) posterior mapping
         a_step_sq = (c_alpha**2 / n_alpha**2).clamp(0, 1)
         beta_step = 1 - a_step_sq
 
@@ -548,12 +549,99 @@ class DDGANLoss(nn.Module):
 
         x_next_fake = mean + torch.sqrt(var.clamp(min=1e-20)) * torch.randn_like(x_curr)
 
-        D_fake = D(x_next_fake.detach(), x_curr.detach(), t_curr)
-        errD_fake = torch.nn.functional.softplus(D_fake).mean()
+        return (
+            x_next,
+            x_curr,
+            x_next_fake,
+            t_curr,
+            B,
+            alpha_step,
+            sigma_step,
+        )
 
-        loss_D = errD_real + errD_fake
+    def _forward_softplus(self, model, x, prompt=None):
+        G, D = model["G"], model["D"]
+        (
+            x_next,
+            x_curr,
+            x_next_fake,
+            t_curr,
+            B,
+            _,
+            _,
+        ) = self._sample_diffusion_pairs(model, x)
 
-        D_fake_G = D(x_next_fake, x_curr, t_curr)
-        loss_G = torch.nn.functional.softplus(-D_fake_G).mean()
+        x_next = x_next.detach().requires_grad_(True)
+        d_real = D(x_next, x_curr.detach(), t_curr)
+        err_d_real = torch.nn.functional.softplus(-d_real).mean()
 
-        return loss_D, loss_G
+        if self.r1_gamma > 0.0:
+            grad_real = torch.autograd.grad(
+                outputs=d_real.sum(), inputs=x_next, create_graph=True
+            )[0]
+            grad_pen = (grad_real.view(B, -1).norm(2, dim=1) ** 2).mean()
+            err_d_real = err_d_real + self.r1_gamma / 2 * grad_pen
+
+        d_fake = D(x_next_fake.detach(), x_curr.detach(), t_curr)
+        err_d_fake = torch.nn.functional.softplus(d_fake).mean()
+
+        loss_d = err_d_real + err_d_fake
+
+        d_fake_g = D(x_next_fake, x_curr, t_curr)
+        loss_g = torch.nn.functional.softplus(-d_fake_g).mean()
+
+        return loss_d, loss_g
+
+    def _forward_bce(self, model, x, prompt=None):
+        G, D = model["G"], model["D"]
+        (
+            x_next,
+            x_curr,
+            x_next_fake,
+            t_curr,
+            B,
+            alpha_step,
+            sigma_step,
+        ) = self._sample_diffusion_pairs(model, x)
+
+        x_next = x_next.detach().requires_grad_(True)
+        d_real = D(x_next, x_curr.detach(), t_curr)
+
+        # Clamping prevents log(0) NaN underflow when sigmoid saturates
+        d_real_safe = d_real.clamp(min=1e-7, max=1.0 - 1e-7)
+        err_d_real = torch.nn.functional.binary_cross_entropy_with_logits(
+            d_real_safe, torch.ones_like(d_real_safe)
+        )
+
+        if self.r1_gamma > 0.0:
+            grad_real = torch.autograd.grad(
+                outputs=d_real.sum(), inputs=x_next, create_graph=True
+            )[0]
+            grad_pen = (grad_real.view(B, -1).norm(2, dim=1) ** 2).mean()
+            err_d_real = err_d_real + self.r1_gamma / 2 * grad_pen
+
+        d_fake = D(x_next_fake.detach(), x_curr.detach(), t_curr)
+        d_fake_safe = d_fake.clamp(min=1e-7, max=1.0 - 1e-7)
+        err_d_fake = torch.nn.functional.binary_cross_entropy_with_logits(
+            d_fake_safe, torch.zeros_like(d_fake_safe)
+        )
+
+        loss_d = err_d_real + err_d_fake
+
+        d_fake_g = D(x_next_fake, x_curr, t_curr)
+        d_fake_g_safe = d_fake_g.clamp(min=1e-7, max=1.0 - 1e-7)
+        loss_g = torch.nn.functional.binary_cross_entropy_with_logits(
+            d_fake_g_safe, torch.ones_like(d_fake_g_safe)
+        )
+
+        # Auxiliary Forward Diffusion (AFD) cycle-consistency error
+        if self.ac_w > 0.0:
+            eps_cycle = torch.randn_like(x_next_fake)
+            x_curr_fake = alpha_step * x_next_fake + sigma_step * eps_cycle
+            afd_error = torch.square(x_curr_fake - x_curr).mean()
+            loss_g = loss_g + self.ac_w * afd_error
+
+        return loss_d, loss_g
+
+    def forward(self, model, x, prompt=None):
+        return self._forward_impl(model, x, prompt)
