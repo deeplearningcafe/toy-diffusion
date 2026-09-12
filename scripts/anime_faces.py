@@ -67,8 +67,8 @@ def run_anime_faces_experiment(args):
     logging.info("\n=== Step 1: Pretraining Base FM Model (1-Rectified Flow) ===")
 
     # Load VAE Config to dynamically extract scale and shift
-    vae_scale = 1.0
-    vae_shift = 0.0
+    vae_scale = config.get("vae_scale", 1.0)
+    vae_shift = config.get("vae_shift", 0.0)
     if config.get("is_latents", False) and "vae_pretrained" in config:
         vae_config = AutoencoderKL.load_config(config["vae_pretrained"])
         vae_scale = vae_config.get("scaling_factor", 1.0)

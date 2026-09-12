@@ -151,15 +151,18 @@ class Trainer:
             ignore_scheduler = self.config.get(
                 "ignore_checkpoint_scheduler", False
             ) or not self.config.get("use_scheduler", True)
+            ignore_optimizer = self.config.get(
+                "ignore_checkpoint_optimizer", False
+            )
             self.start_epoch, ckpt_cfg, ckpt_vocab = load_from_checkpoint(
                 checkpoint_dir=resume_dir,
                 model=self.model,
-                optimizer=self.optimizer,
+                optimizer=None if ignore_optimizer else self.optimizer,
                 scheduler=None if ignore_scheduler else self.scheduler,
                 ema=self.ema,
                 skip_text_enc=True if config.get("hf_text_encoder", None) else False,
             )
-            if ignore_scheduler:
+            if ignore_scheduler or ignore_optimizer:
                 skip_warmup = self.config.get("skip_warmup", False)
                 # TODO: clear memory, decuple optimizer from scheduler
                 self.optimizer, self.scheduler = create_optim_scheduler(
@@ -169,17 +172,19 @@ class Trainer:
                     skip_warmup=skip_warmup,
                     start_epoch=self.start_epoch,
                 )
-                # Re-load the optimizer state for the newly created optimizer
-                _ = load_from_checkpoint(
-                    checkpoint_dir=resume_dir,
-                    model=self.model,
-                    optimizer=self.optimizer,
-                    scheduler=None,
-                    ema=self.ema,
-                    skip_text_enc=True
-                    if config.get("hf_text_encoder", None)
-                    else False,
-                )
+                
+                # Only reload optimizer state if ignore_optimizer is False
+                if not ignore_optimizer:
+                    _ = load_from_checkpoint(
+                        checkpoint_dir=resume_dir,
+                        model=self.model,
+                        optimizer=self.optimizer,
+                        scheduler=None,
+                        ema=self.ema,
+                        skip_text_enc=True
+                        if config.get("hf_text_encoder", None)
+                        else False,
+                    )
                 torch.cuda.empty_cache()
             if ckpt_vocab and "vocab" not in self.config:
                 self.config["vocab"] = ckpt_vocab

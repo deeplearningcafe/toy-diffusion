@@ -154,15 +154,10 @@ def main():
     output_path = Path(args.output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
 
-    vae_scale = 1.0
-    vae_shift = 0.0
-    if config.get("is_latents", False) and "vae_pretrained" in config:
-        vae_config = AutoencoderKL.load_config(config["vae_pretrained"])
-        vae_scale = vae_config.get("scaling_factor", 1.0)
-        vae_shift = vae_config.get("shift_factor", 0.0)
-        if vae_shift is None:
-            vae_shift = 0.0
+    vae_scale = config.get("vae_scale", 1.0)
+    vae_shift = config.get("vae_shift", 0.0)
 
+    print(f"Using vae scale: {vae_scale} and shift {vae_shift}")
     print(f"Scanning source dataset prompts from {config.get('data_path')}...")
     dataset = ImageDataset(
         root_dir=config.get("data_path"),
@@ -172,7 +167,7 @@ def main():
         load_into_ram=False,
         vae_scale=vae_scale,
         vae_shift=vae_shift,
-        compute_normalization=True,
+        compute_normalization=False,
         use_short_prompts=config.get("use_short_prompts", False),
         tokenizer=config.get("hf_text_encoder", None),
     )
@@ -180,6 +175,7 @@ def main():
     config["vae_scale"] = dataset.vae_scale
     config["vae_shift"] = dataset.vae_shift
     config["use_scheduler"] = False
+    config["ignore_checkpoint_optimizer"] = True
 
     sample_latent = dataset[0][0]
     data_shape = list(sample_latent.shape)

@@ -497,35 +497,78 @@ def get_vae(config, device, dtype=torch.bfloat16):
     return vae
 
 
-def load_latent_to_pixel_weights(model: nn.Module, checkpoint_dir: str):
+def load_latent_to_pixel_weights(
+    model: nn.Module,
+    checkpoint_dir: str,
+    ema=None,
+    prefer_ema: bool = True,
+):
     """
     Transfers Transformer backbone and conditioning weights from a latent
-    checkpoint to a pixel DiT, leaving patch embedding and DiP decoder to train.
+    checkpoint to a pixel DiT. Safely handles .safetensors and .pt formats,
+    prioritizes EMA weights, and avoids non-weight files (e.g., optimizer.pt).
     """
+    try:
+        from safetensors.torch import load_file as load_safetensors
+    except ImportError:
+        load_safetensors = None
+
     ckpt_path = Path(checkpoint_dir)
-    if ckpt_path.is_dir():
-        candidates = ["model.pt", "checkpoint.pt", "ema_model.pt"]
-        ckpt_file = None
-        for c in candidates:
-            if (ckpt_path / c).exists():
-                ckpt_file = ckpt_path / c
-                break
-        if ckpt_file is None:
-            pt_files = list(ckpt_path.glob("*.pt"))
-            if pt_files:
-                ckpt_file = pt_files[0]
-    else:
+    ckpt_file = None
+
+    if ckpt_path.is_file():
         ckpt_file = ckpt_path
+    elif ckpt_path.is_dir():
+        if prefer_ema:
+            candidates = [
+                "ema_model.safetensors",
+                "ema_model.pt",
+                "model.safetensors",
+                "model.pt",
+                "checkpoint.pt",
+            ]
+        else:
+            candidates = [
+                "model.safetensors",
+                "model.pt",
+                "ema_model.safetensors",
+                "ema_model.pt",
+                "checkpoint.pt",
+            ]
+
+        for c in candidates:
+            target = ckpt_path / c
+            if target.exists():
+                ckpt_file = target
+                break
 
     if ckpt_file is None or not ckpt_file.exists():
-        raise FileNotFoundError(f"No checkpoint file found at {checkpoint_dir}")
+        raise FileNotFoundError(
+            f"No valid model weight file found in {checkpoint_dir}. "
+            f"Searched for candidates: {candidates}"
+        )
 
     logging.info(f"Transferring latent priors from {ckpt_file}...")
-    state_dict = torch.load(ckpt_file, map_location="cpu", weights_only=False)
-    if "model" in state_dict:
-        state_dict = state_dict["model"]
-    elif "ema_model" in state_dict:
+
+    if ckpt_file.suffix == ".safetensors":
+        if load_safetensors is None:
+            raise ImportError(
+                "Loading .safetensors requires 'safetensors'. "
+                "Install via: pip install safetensors"
+            )
+        state_dict = load_safetensors(str(ckpt_file), device="cpu")
+    else:
+        state_dict = torch.load(
+            ckpt_file, map_location="cpu", weights_only=False
+        )
+
+    # Unwrap nested state dict structures
+    if "ema_model" in state_dict and prefer_ema:
         state_dict = state_dict["ema_model"]
+    elif "model" in state_dict:
+        state_dict = state_dict["model"]
+    elif "state_dict" in state_dict:
+        state_dict = state_dict["state_dict"]
 
     target_state = model.state_dict()
     filtered_dict = {}
@@ -537,13 +580,23 @@ def load_latent_to_pixel_weights(model: nn.Module, checkpoint_dir: str):
             if target_state[clean_k].shape == v.shape:
                 filtered_dict[clean_k] = v
             else:
-                skipped_keys.append((clean_k, "shape mismatch"))
+                skipped_keys.append((clean_k, f"shape {v.shape} != target"))
         else:
             skipped_keys.append((clean_k, "not in target model"))
 
     missing, unexpected = model.load_state_dict(filtered_dict, strict=False)
+
     logging.info(
-        f"Transferred {len(filtered_dict)} layers from latent checkpoint. "
-        f"Skipped {len(skipped_keys)} mismatched layers (e.g. input/output heads)."
-        f"Skipped {skipped_keys}"
+        f"Successfully transferred {len(filtered_dict)} layers from {ckpt_file.name}."
     )
+    logging.info(
+        f"Skipped {len(skipped_keys)} non-matching layers "
+        f"(expected for patch embedder and pixel decoder)."
+    )
+
+    # Re-synchronize target EMA tracker if provided
+    if ema is not None:
+        logging.info("Synchronizing target EMA shadow weights with model...")
+        ema.initialize(model)
+
+    return model

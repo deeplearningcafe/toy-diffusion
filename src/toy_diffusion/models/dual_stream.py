@@ -470,12 +470,12 @@ class DualStreamDiT(nn.Module):
             self._zero_initialize_output()
 
         # Freeze dead text path in the final decoder block (output is discarded)
-        if len(self.out_blocks) > 0:
-            last_block = self.out_blocks[-1]
-            for p in last_block.attn.proj_text.parameters():
-                p.requires_grad = False
-            for p in last_block.mlp_text.parameters():
-                p.requires_grad = False
+        #if len(self.out_blocks) > 0:
+        #    last_block = self.out_blocks[-1]
+        #    for p in last_block.attn.proj_text.parameters():
+        #        p.requires_grad = False
+        #    for p in last_block.mlp_text.parameters():
+        #        p.requires_grad = False
 
     def _zero_initialize_output(self):
         """Crucial for diffusion/flow matching: start by predicting zero velocity/noise."""

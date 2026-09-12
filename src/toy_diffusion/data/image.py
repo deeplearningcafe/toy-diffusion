@@ -512,7 +512,7 @@ class ImageDataset(Dataset):
             return self.tensors_list[idx]
         else:
             path = self.img_paths[idx]
-            entry = self.load_entry(path)
+            entry, _ = self.load_entry(path)
             data = entry[0]
             if self.conditional:
                 prompt = entry[1]
