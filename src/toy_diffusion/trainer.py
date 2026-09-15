@@ -103,6 +103,8 @@ class Trainer:
             logging.info("Loading pretrained model...")
             self.model = pretrained_model
             self.model.to(self.device)
+            # apply only to pretrained model
+            set_trainable_layers(self.model, train_output_only=self.config.get("train_output_only", False))
         else:
             self.model = get_model(config, self.device)
         self.schedule, self.loss_fn, self.model = get_schedule_loss(

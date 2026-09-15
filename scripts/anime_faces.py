@@ -134,7 +134,10 @@ def run_anime_faces_experiment(args):
     if is_pixel_training and latent_checkpoint:
         config["resume_from_checkpoint"] = None
 
-    pred_target = config["loss_target"]
+    
+    pred_target = config.get(
+        "prediction_target", config.get("loss_target", "v")
+    )
     trainer = Trainer(config, prediction_target=pred_target, dataset=dataset)
 
     if is_pixel_training and latent_checkpoint:

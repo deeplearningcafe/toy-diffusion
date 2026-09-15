@@ -122,6 +122,7 @@ class GeneralDiffusionLoss(nn.Module):
         train_shift: float = 1.0,
         is_conditional: bool = False,
         use_cfm: bool = False,
+        noise_scale: float = 1.0,
     ):
         super().__init__()
         self.schedule = schedule
@@ -133,6 +134,7 @@ class GeneralDiffusionLoss(nn.Module):
         self.use_ot = use_ot
         self.train_shift = train_shift
         self.use_cfm = use_cfm if is_conditional else False
+        self.noise_scale = noise_scale
 
         self.set_conditional(is_conditional)
 
@@ -232,6 +234,10 @@ class GeneralDiffusionLoss(nn.Module):
         t_view = t.view(-1, *([1] * (data.ndim - 1)))
 
         alpha, sigma, d_alpha, d_sigma = self.schedule.get_coefficients(t_view)
+
+        if self.noise_scale != 1.0:
+            sigma = sigma * self.noise_scale
+            d_sigma = d_sigma * self.noise_scale
 
         if self.input_perturbation > 0.0:
             noise_perturb = torch.randn_like(data) * self.input_perturbation

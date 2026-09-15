@@ -262,6 +262,8 @@ def get_model(config, device):
             activation=torch.nn.SiLU,
         ).to(device)
 
+    set_trainable_layers(model, train_output_only=config.get("train_output_only", False))
+
     def count_parameters(model):
         return sum(p.numel() for p in model.parameters() if p.requires_grad)
 
@@ -328,6 +330,7 @@ def get_schedule_loss(config, model, prediction_target, device):
             train_shift=config.get("train_shift", 1.0),
             is_conditional=config.get("is_conditional", False),
             use_cfm=config.get("use_cfm", False),
+            noise_scale=config.get("noise_scale", 1.0),
         )
     return schedule, loss_fn, model
 
@@ -599,4 +602,50 @@ def load_latent_to_pixel_weights(
         logging.info("Synchronizing target EMA shadow weights with model...")
         ema.initialize(model)
 
+    return model
+
+def set_trainable_layers(
+    model: nn.Module, train_output_only: bool = False
+):
+    """
+    Configures parameter gradients for two-stage adaptation.
+    If train_output_only is True, freezes all backbone and conditioning
+    modules while keeping pixel-adaptation input, output, and final norm
+    layers trainable.
+    """
+    if not train_output_only:
+        return model
+
+    trainable_modules = {
+        "x_embedder",
+        "conv_in",
+        "pixel_decoder",
+        "proj_out",
+        "conv_out",
+        "norm_final",
+        "norm_out",
+    }
+
+    trainable_count = 0
+    frozen_count = 0
+
+    for name, param in model.named_parameters():
+        clean_name = (
+            name[len("_orig_mod.") :]
+            if name.startswith("_orig_mod.")
+            else name
+        )
+        parts = set(clean_name.split("."))
+        is_trainable = bool(parts & trainable_modules)
+
+        param.requires_grad = is_trainable
+        if is_trainable:
+            trainable_count += param.numel()
+        else:
+            frozen_count += param.numel()
+
+    logging.info(
+        f"Stage-1 Adaptation: {trainable_count / 1e6:.2f}M trainable params, "
+        f"{frozen_count / 1e6:.2f}M frozen params."
+    )
     return model
