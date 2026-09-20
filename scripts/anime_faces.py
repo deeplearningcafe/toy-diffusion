@@ -13,6 +13,7 @@ from toy_diffusion.data.image import ImageDataset, TieredBatchSampler
 from toy_diffusion.utils.logging_utils import Logger
 from toy_diffusion.utils.evaluation_utils import evaluate_model
 from toy_diffusion.utils.trainer_utils import load_latent_to_pixel_weights
+from toy_diffusion.utils.checkpointing import load_pixel_weights
 
 
 def run_anime_faces_experiment(args):
@@ -134,14 +135,14 @@ def run_anime_faces_experiment(args):
     if is_pixel_training and latent_checkpoint:
         config["resume_from_checkpoint"] = None
 
-    
-    pred_target = config.get(
-        "prediction_target", config.get("loss_target", "v")
-    )
+    pred_target = config.get("prediction_target", config.get("loss_target", "v"))
     trainer = Trainer(config, prediction_target=pred_target, dataset=dataset)
 
     if is_pixel_training and latent_checkpoint:
         load_latent_to_pixel_weights(trainer.model, latent_checkpoint)
+        pixel_dir = config.get("pixel_dir", None)
+        if pixel_dir:
+            load_pixel_weights(trainer.model, pixel_dir, ema=trainer.ema)
 
     trainer.train(
         config["epochs"],

@@ -5,6 +5,7 @@ import torch.nn as nn
 import logging
 import omegaconf
 import os
+from safetensors.torch import load_file
 
 try:
     from diffusers import AutoencoderKL
@@ -41,7 +42,10 @@ from toy_diffusion.losses import (
 )
 from toy_diffusion.paths.scheduler import LinearSchedule, DDPMSchedule, VESchedule
 
-from toy_diffusion.utils.checkpointing import load_checkpoint_vocab
+from toy_diffusion.utils.checkpointing import (
+    load_checkpoint_vocab,
+    PIXEL_EXPLICIT_MODULES,
+)
 
 
 def get_model(config, device):
@@ -262,7 +266,9 @@ def get_model(config, device):
             activation=torch.nn.SiLU,
         ).to(device)
 
-    set_trainable_layers(model, train_output_only=config.get("train_output_only", False))
+    set_trainable_layers(
+        model, train_output_only=config.get("train_output_only", False)
+    )
 
     def count_parameters(model):
         return sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -508,62 +514,13 @@ def load_latent_to_pixel_weights(
 ):
     """
     Transfers Transformer backbone and conditioning weights from a latent
-    checkpoint to a pixel DiT. Safely handles .safetensors and .pt formats,
-    prioritizes EMA weights, and avoids non-weight files (e.g., optimizer.pt).
+    checkpoint to a pixel DiT.
     """
-    try:
-        from safetensors.torch import load_file as load_safetensors
-    except ImportError:
-        load_safetensors = None
+    model_path = os.path.join(checkpoint_dir, "model.safetensors")
+    if os.path.exists(model_path):
+        state_dict = load_file(model_path)
 
-    ckpt_path = Path(checkpoint_dir)
-    ckpt_file = None
-
-    if ckpt_path.is_file():
-        ckpt_file = ckpt_path
-    elif ckpt_path.is_dir():
-        if prefer_ema:
-            candidates = [
-                "ema_model.safetensors",
-                "ema_model.pt",
-                "model.safetensors",
-                "model.pt",
-                "checkpoint.pt",
-            ]
-        else:
-            candidates = [
-                "model.safetensors",
-                "model.pt",
-                "ema_model.safetensors",
-                "ema_model.pt",
-                "checkpoint.pt",
-            ]
-
-        for c in candidates:
-            target = ckpt_path / c
-            if target.exists():
-                ckpt_file = target
-                break
-
-    if ckpt_file is None or not ckpt_file.exists():
-        raise FileNotFoundError(
-            f"No valid model weight file found in {checkpoint_dir}. "
-            f"Searched for candidates: {candidates}"
-        )
-
-    logging.info(f"Transferring latent priors from {ckpt_file}...")
-
-    if ckpt_file.suffix == ".safetensors":
-        if load_safetensors is None:
-            raise ImportError(
-                "Loading .safetensors requires 'safetensors'. "
-                "Install via: pip install safetensors"
-            )
-        state_dict = load_safetensors(str(ckpt_file), device="cpu")
-    else:
-        state_dict = torch.load(
-            ckpt_file, map_location="cpu", weights_only=False
-        )
+    logging.info(f"Transferring latent priors from {checkpoint_dir}...")
 
     # Unwrap nested state dict structures
     if "ema_model" in state_dict and prefer_ema:
@@ -590,7 +547,7 @@ def load_latent_to_pixel_weights(
     missing, unexpected = model.load_state_dict(filtered_dict, strict=False)
 
     logging.info(
-        f"Successfully transferred {len(filtered_dict)} layers from {ckpt_file.name}."
+        f"Successfully transferred {len(filtered_dict)} layers from {checkpoint_dir}."
     )
     logging.info(
         f"Skipped {len(skipped_keys)} non-matching layers "
@@ -604,9 +561,8 @@ def load_latent_to_pixel_weights(
 
     return model
 
-def set_trainable_layers(
-    model: nn.Module, train_output_only: bool = False
-):
+
+def set_trainable_layers(model: nn.Module, train_output_only: bool = False):
     """
     Configures parameter gradients for two-stage adaptation.
     If train_output_only is True, freezes all backbone and conditioning
@@ -616,27 +572,15 @@ def set_trainable_layers(
     if not train_output_only:
         return model
 
-    trainable_modules = {
-        "x_embedder",
-        "conv_in",
-        "pixel_decoder",
-        "proj_out",
-        "conv_out",
-        "norm_final",
-        "norm_out",
-    }
-
     trainable_count = 0
     frozen_count = 0
 
     for name, param in model.named_parameters():
         clean_name = (
-            name[len("_orig_mod.") :]
-            if name.startswith("_orig_mod.")
-            else name
+            name[len("_orig_mod.") :] if name.startswith("_orig_mod.") else name
         )
         parts = set(clean_name.split("."))
-        is_trainable = bool(parts & trainable_modules)
+        is_trainable = bool(parts & PIXEL_EXPLICIT_MODULES)
 
         param.requires_grad = is_trainable
         if is_trainable:
@@ -649,3 +593,4 @@ def set_trainable_layers(
         f"{frozen_count / 1e6:.2f}M frozen params."
     )
     return model
+

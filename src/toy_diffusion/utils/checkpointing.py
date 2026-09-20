@@ -5,6 +5,16 @@ import torch
 import torch.nn as nn
 from safetensors.torch import save_file, load_file
 
+PIXEL_EXPLICIT_MODULES = {
+    "x_embedder",
+    "conv_in",
+    "pixel_decoder",
+    "proj_out",
+    "conv_out",
+    "norm_final",
+    "norm_out",
+}
+
 
 def save_checkpoint(
     output_dir: str,
@@ -16,10 +26,12 @@ def save_checkpoint(
     config: dict = None,
     vocab: dict = None,
     skip_text_enc: bool = False,
+    train_output_only: bool = False,
 ):
     """
     Saves model checkpoint weights, optimizer, scheduler, EMA,
-    config.json (HuggingFace architecture style), and vocab.json.
+    config.json, and vocab.json. If train_output_only is True, saves
+    only explicitly defined pixel adaptation layers.
     """
 
     save_dir = os.path.join(output_dir, f"epoch_{epoch}")
@@ -30,8 +42,17 @@ def save_checkpoint(
 
     if skip_text_enc:
         clean_state_dict = {
-            k: v for k, v in clean_state_dict.items()
-            if not k.startswith("text_enc.")
+            k: v for k, v in clean_state_dict.items() if not k.startswith("text_enc.")
+        }
+
+    is_output_only = train_output_only or (
+        config is not None and config.get("train_output_only", False)
+    )
+    if is_output_only:
+        clean_state_dict = {
+            k: v
+            for k, v in clean_state_dict.items()
+            if set(k.split(".")) & PIXEL_EXPLICIT_MODULES
         }
 
     # Cast only floating-point tensors to bfloat16 to halve disk size
@@ -51,10 +72,17 @@ def save_checkpoint(
 
         if skip_text_enc:
             clean_ema_state_dict = {
-                k: v for k, v in clean_ema_state_dict.items()
+                k: v
+                for k, v in clean_ema_state_dict.items()
                 if not k.startswith("text_enc.")
             }
 
+        if is_output_only:
+            clean_ema_state_dict = {
+                k: v
+                for k, v in clean_ema_state_dict.items()
+                if set(k.split(".")) & PIXEL_EXPLICIT_MODULES
+            }
         # Cast EMA floating point tensors
         clean_ema_state_dict = {
             k: v.to(torch.bfloat16) if v.is_floating_point() else v
@@ -88,6 +116,7 @@ def save_checkpoint(
             "loss_target": config.get("loss_target", "v"),
             "tiers_len": config.get("tiers_len", [24, 52]),
             "max_seq_len": config.get("max_seq_len", 16),
+            "train_output_only": train_output_only,
         }
 
         # Include other serializable configuration items
@@ -137,6 +166,7 @@ def load_from_checkpoint(
     scheduler=None,
     ema=None,
     skip_text_enc: bool = False,
+    pixel_dir: str = None,
 ) -> tuple[int, dict, dict]:
     """
     Loads states from a checkpoint directory.
@@ -144,7 +174,7 @@ def load_from_checkpoint(
     """
     logging.info(f"Loading checkpoint from {checkpoint_dir}")
 
-    strict = True if not skip_text_enc else False
+    strict = True if (not skip_text_enc and pixel_dir is None) else False
     if model is not None:
         model_path = os.path.join(checkpoint_dir, "model.safetensors")
         if os.path.exists(model_path):
@@ -152,7 +182,18 @@ def load_from_checkpoint(
             sanitized_dict = {
                 k.replace("_orig_mod.", ""): v for k, v in state_dict.items()
             }
+            # filter pixel layers
+            if pixel_dir is not None:
+                target_state = model.state_dict()
+                sanitized_dict = {
+                    k: v
+                    for k, v in sanitized_dict.items()
+                    if k in target_state and target_state[k].shape == v.shape
+                }
             model.load_state_dict(sanitized_dict, strict=strict)
+
+        if pixel_dir is not None:
+            load_pixel_weights(model, pixel_dir, ema=ema)
 
     if ema is not None and getattr(ema, "use_ema", False):
         ema_path = os.path.join(checkpoint_dir, "ema_model.safetensors")
@@ -160,7 +201,15 @@ def load_from_checkpoint(
             if ema.ema_model is None and model is not None:
                 ema.initialize(model)
             if ema.ema_model is not None:
-                ema.ema_model.load_state_dict(load_file(ema_path), strict=strict)
+                ema_dict = load_file(ema_path)
+                if pixel_dir is not None:
+                    target_state = ema.ema_model.state_dict()
+                    ema_dict = {
+                        k: v
+                        for k, v in ema_dict.items()
+                        if k in target_state and target_state[k].shape == v.shape
+                    }
+                ema.ema_model.load_state_dict(ema_dict, strict=strict)
 
     if optimizer is not None:
         opt_path = os.path.join(checkpoint_dir, "optimizer.pt")
@@ -177,9 +226,7 @@ def load_from_checkpoint(
         sched_path = os.path.join(checkpoint_dir, "scheduler.pt")
         if os.path.exists(sched_path):
             try:
-                scheduler.load_state_dict(
-                    torch.load(sched_path, map_location="cpu")
-                )
+                scheduler.load_state_dict(torch.load(sched_path, map_location="cpu"))
             except Exception as e:
                 logging.error(
                     f"Could not load scheduler state dict: {e}. "
@@ -199,3 +246,80 @@ def load_from_checkpoint(
 
     logging.info(f"Resumed training from epoch {start_epoch}")
     return start_epoch, ckpt_config, ckpt_vocab
+
+
+def load_pixel_weights(
+    model: nn.Module,
+    checkpoint_dir: str,
+    ema=None,
+) -> nn.Module:
+    """
+    Loads only explicit pixel adaptation layers (x_embedder, pixel_decoder,
+    norm_final) from a checkpoint into the model and optional EMA tracker.
+    """
+    logging.info(f"Loading pixel adaptation weights from: {checkpoint_dir}")
+    model_path = os.path.join(checkpoint_dir, "model.safetensors")
+    if os.path.exists(model_path):
+        state_dict = load_file(model_path)
+
+    if "model" in state_dict:
+        state_dict = state_dict["model"]
+    elif "state_dict" in state_dict:
+        state_dict = state_dict["state_dict"]
+
+    target_state = model.state_dict()
+    pixel_dict = {}
+
+    for k, v in state_dict.items():
+        clean_k = k.replace("_orig_mod.", "")
+        parts = set(clean_k.split("."))
+        if not (parts & PIXEL_EXPLICIT_MODULES):
+            continue
+
+        target_key = None
+        if clean_k in target_state:
+            target_key = clean_k
+        elif f"unet.{clean_k}" in target_state:
+            target_key = f"unet.{clean_k}"
+        elif clean_k.startswith("unet.") and clean_k[5:] in target_state:
+            target_key = clean_k[5:]
+
+        if target_key is not None:
+            if target_state[target_key].shape != v.shape:
+                raise ValueError(
+                    f"Shape mismatch for pixel layer '{target_key}': "
+                    f"model {target_state[target_key].shape} vs "
+                    f"ckpt {v.shape}"
+                )
+            pixel_dict[target_key] = v
+
+    if not pixel_dict:
+        raise KeyError(
+            f"No pixel adaptation weights found in checkpoint {checkpoint_dir}."
+        )
+
+    model.load_state_dict(pixel_dict, strict=False)
+    logging.info(f"Loaded {len(pixel_dict)} pixel adaptation layers successfully.")
+
+    if ema is not None and getattr(ema, "ema_model", None) is not None:
+        ema_path = os.path.join(checkpoint_dir, "ema_model.safetensors")
+        if os.path.exists(ema_path):
+            ema_dict = load_file(ema_path)
+            clean_ema = {}
+            for k, v in ema_dict.items():
+                clean_k = k.replace("_orig_mod.", "")
+                if set(clean_k.split(".")) & PIXEL_EXPLICIT_MODULES:
+                    target_key = None
+                    if clean_k in target_state:
+                        target_key = clean_k
+                    elif f"unet.{clean_k}" in target_state:
+                        target_key = f"unet.{clean_k}"
+                    elif clean_k.startswith("unet.") and clean_k[5:] in target_state:
+                        target_key = clean_k[5:]
+                    if target_key is not None:
+                        clean_ema[target_key] = v
+            ema.ema_model.load_state_dict(clean_ema, strict=False)
+        else:
+            ema.ema_model.load_state_dict(pixel_dict, strict=False)
+
+    return model

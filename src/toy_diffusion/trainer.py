@@ -15,6 +15,7 @@ from toy_diffusion.utils.trainer_utils import (
     create_optim_scheduler,
     gpu_setup,
     get_vae,
+    set_trainable_layers,
 )
 from toy_diffusion.models.aux_models import EMAModel
 from toy_diffusion.paths.sampling import generate_samples
@@ -99,12 +100,16 @@ class Trainer:
             if self.config.get("cross_attention_dim") is None:
                 self.config["cross_attention_dim"] = 256
 
+        self.train_output_only = self.config.get("train_output_only", False)
         if pretrained_model is not None:
             logging.info("Loading pretrained model...")
             self.model = pretrained_model
             self.model.to(self.device)
             # apply only to pretrained model
-            set_trainable_layers(self.model, train_output_only=self.config.get("train_output_only", False))
+            set_trainable_layers(
+                self.model,
+                train_output_only=self.train_output_only,
+            )
         else:
             self.model = get_model(config, self.device)
         self.schedule, self.loss_fn, self.model = get_schedule_loss(
@@ -149,13 +154,12 @@ class Trainer:
 
         self.start_epoch = 0
         resume_dir = config.get("resume_from_checkpoint", None)
+        pixel_ckpt = config.get("pixel_checkpoint", None)
         if resume_dir is not None:
             ignore_scheduler = self.config.get(
                 "ignore_checkpoint_scheduler", False
             ) or not self.config.get("use_scheduler", True)
-            ignore_optimizer = self.config.get(
-                "ignore_checkpoint_optimizer", False
-            )
+            ignore_optimizer = self.config.get("ignore_checkpoint_optimizer", False)
             self.start_epoch, ckpt_cfg, ckpt_vocab = load_from_checkpoint(
                 checkpoint_dir=resume_dir,
                 model=self.model,
@@ -163,6 +167,7 @@ class Trainer:
                 scheduler=None if ignore_scheduler else self.scheduler,
                 ema=self.ema,
                 skip_text_enc=True if config.get("hf_text_encoder", None) else False,
+                pixel_checkpoint=pixel_ckpt,
             )
             if ignore_scheduler or ignore_optimizer:
                 skip_warmup = self.config.get("skip_warmup", False)
@@ -174,7 +179,7 @@ class Trainer:
                     skip_warmup=skip_warmup,
                     start_epoch=self.start_epoch,
                 )
-                
+
                 # Only reload optimizer state if ignore_optimizer is False
                 if not ignore_optimizer:
                     _ = load_from_checkpoint(
@@ -186,6 +191,7 @@ class Trainer:
                         skip_text_enc=True
                         if config.get("hf_text_encoder", None)
                         else False,
+                        pixel_checkpoint=pixel_ckpt,
                     )
                 torch.cuda.empty_cache()
             if ckpt_vocab and "vocab" not in self.config:
@@ -507,6 +513,7 @@ class Trainer:
                     skip_text_enc=True
                     if self.config.get("hf_text_encoder", None)
                     else False,
+                    train_output_only=self.train_output_only,
                 )
 
         return self.model
