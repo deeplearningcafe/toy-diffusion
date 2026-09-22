@@ -48,6 +48,14 @@ from toy_diffusion.utils.checkpointing import (
 )
 
 
+def _normalize_param_key(k: str) -> str:
+    """Removes torch.compile wrappers and module prefixes for matching."""
+    k = k.replace("_orig_mod.", "")
+    if k.startswith("unet."):
+        k = k[5:]
+    return k
+
+
 def get_model(config, device):
     text_enc = None
     cross_attention_dim = config.get("cross_attention_dim", None)
@@ -531,18 +539,27 @@ def load_latent_to_pixel_weights(
         state_dict = state_dict["state_dict"]
 
     target_state = model.state_dict()
+    target_key_map = {_normalize_param_key(k): k for k in target_state.keys()}
+
     filtered_dict = {}
     skipped_keys = []
 
     for k, v in state_dict.items():
-        clean_k = k[len("_orig_mod.") :] if k.startswith("_orig_mod.") else k
-        if clean_k in target_state:
-            if target_state[clean_k].shape == v.shape:
-                filtered_dict[clean_k] = v
+        norm_k = _normalize_param_key(k)
+        if norm_k in target_key_map:
+            real_target_k = target_key_map[norm_k]
+            if target_state[real_target_k].shape == v.shape:
+                filtered_dict[real_target_k] = v
             else:
-                skipped_keys.append((clean_k, f"shape {v.shape} != target"))
+                skipped_keys.append(
+                    (
+                        k,
+                        f"shape {v.shape} != target "
+                        f"{target_state[real_target_k].shape}",
+                    )
+                )
         else:
-            skipped_keys.append((clean_k, "not in target model"))
+            skipped_keys.append((k, "not in target model"))
 
     missing, unexpected = model.load_state_dict(filtered_dict, strict=False)
 
@@ -575,7 +592,7 @@ def set_trainable_layers(model: nn.Module, train_output_only: bool = False):
     trainable_count = 0
     frozen_count = 0
 
-    for name, param in model.named_parameters():
+    for name, param in model["unet"].named_parameters():
         clean_name = (
             name[len("_orig_mod.") :] if name.startswith("_orig_mod.") else name
         )
@@ -593,4 +610,3 @@ def set_trainable_layers(model: nn.Module, train_output_only: bool = False):
         f"{frozen_count / 1e6:.2f}M frozen params."
     )
     return model
-

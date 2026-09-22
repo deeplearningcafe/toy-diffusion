@@ -275,7 +275,9 @@ class ImageDataset(Dataset):
         if self.load_into_ram:
             prompts = [item[1] for item in self.tensors_list]
         else:
-            prompts = [self._get_prompt(p) for p in self.img_paths]
+            # Parallelize prompt loading from disk
+            with ThreadPoolExecutor(max_workers=self.num_workers) as executor:
+                prompts = list(executor.map(self._get_prompt, self.img_paths))
 
         # Build vocabulary dynamically if utilizing CommaSeparatedTokenizer
         if isinstance(self.tokenizer, CommaSeparatedTokenizer):

@@ -158,11 +158,12 @@ class DualStreamDiTBlock(nn.Module):
         self,
         image_tokens: torch.Tensor,
         text_tokens: torch.Tensor,
-        skip: tuple[torch.Tensor, torch.Tensor],
+        skip_image: torch.Tensor,
+        skip_text: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Encapsulates skip connection calculations to checkpoint them."""
-        img_out = self.skip_linear_image(torch.cat([image_tokens, skip[0]], dim=-1))
-        txt_out = self.skip_linear_text(torch.cat([text_tokens, skip[1]], dim=-1))
+        img_out = self.skip_linear_image(torch.cat([image_tokens, skip_image], dim=-1))
+        txt_out = self.skip_linear_text(torch.cat([text_tokens, skip_text], dim=-1))
         return img_out, txt_out
 
     def _run_post_attn(
@@ -171,7 +172,6 @@ class DualStreamDiTBlock(nn.Module):
         text_tokens: torch.Tensor,
         image_attn: torch.Tensor,
         text_attn: torch.Tensor,
-        text_mask: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Groups all post-attention calculations to discard intermediates."""
         image_tokens = image_tokens + self.norm3(image_attn)
@@ -184,7 +184,7 @@ class DualStreamDiTBlock(nn.Module):
         image_tokens = image_tokens + image_mlp
         text_tokens = text_tokens + text_mlp
 
-        text_tokens = text_tokens * text_mask[:, :, None].to(text_tokens.dtype)
+        # use token mask out of checkpoint as no grad tensors ignored
         return image_tokens, text_tokens
 
     def forward(
@@ -198,7 +198,11 @@ class DualStreamDiTBlock(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if self.use_skip and skip is not None:
             image_tokens, text_tokens = self._checkpoint(
-                self._run_skip, image_tokens, text_tokens, skip
+                self._run_skip,
+                image_tokens,
+                text_tokens,
+                skip[0],
+                skip[1],
             )
 
         image_attn, text_attn = self.attn(
@@ -215,9 +219,10 @@ class DualStreamDiTBlock(nn.Module):
             text_tokens,
             image_attn,
             text_attn,
-            text_mask,
         )
 
+        if text_mask is not None:
+            text_tokens = text_tokens * text_mask[:, :, None].to(text_tokens.dtype)
         return image_tokens, text_tokens
 
 
@@ -470,7 +475,7 @@ class DualStreamDiT(nn.Module):
             self._zero_initialize_output()
 
         # Freeze dead text path in the final decoder block (output is discarded)
-        #if len(self.out_blocks) > 0:
+        # if len(self.out_blocks) > 0:
         #    last_block = self.out_blocks[-1]
         #    for p in last_block.attn.proj_text.parameters():
         #        p.requires_grad = False
