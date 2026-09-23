@@ -16,6 +16,14 @@ PIXEL_EXPLICIT_MODULES = {
 }
 
 
+def _normalize_param_key(k: str) -> str:
+    """Removes torch.compile wrappers and module prefixes for matching."""
+    k = k.replace("_orig_mod.", "")
+    if k.startswith("unet."):
+        k = k[5:]
+    return k
+
+
 def save_checkpoint(
     output_dir: str,
     epoch: int,
@@ -179,17 +187,15 @@ def load_from_checkpoint(
         model_path = os.path.join(checkpoint_dir, "model.safetensors")
         if os.path.exists(model_path):
             state_dict = load_file(model_path)
-            sanitized_dict = {
-                k.replace("_orig_mod.", ""): v for k, v in state_dict.items()
-            }
-            # filter pixel layers
-            if pixel_dir is not None:
-                target_state = model.state_dict()
-                sanitized_dict = {
-                    k: v
-                    for k, v in sanitized_dict.items()
-                    if k in target_state and target_state[k].shape == v.shape
-                }
+            target_state = model.state_dict()
+            target_map = {_normalize_param_key(k): k for k in target_state.keys()}
+            sanitized_dict = {}
+            for k, v in state_dict.items():
+                norm_k = _normalize_param_key(k)
+                if norm_k in target_map:
+                    real_k = target_map[norm_k]
+                    if target_state[real_k].shape == v.shape:
+                        sanitized_dict[real_k] = v
             model.load_state_dict(sanitized_dict, strict=strict)
 
         if pixel_dir is not None:
@@ -202,14 +208,16 @@ def load_from_checkpoint(
                 ema.initialize(model)
             if ema.ema_model is not None:
                 ema_dict = load_file(ema_path)
-                if pixel_dir is not None:
-                    target_state = ema.ema_model.state_dict()
-                    ema_dict = {
-                        k: v
-                        for k, v in ema_dict.items()
-                        if k in target_state and target_state[k].shape == v.shape
-                    }
-                ema.ema_model.load_state_dict(ema_dict, strict=strict)
+                ema_target = ema.ema_model.state_dict()
+                ema_map = {_normalize_param_key(k): k for k in ema_target.keys()}
+                clean_ema = {}
+                for k, v in ema_dict.items():
+                    norm_k = _normalize_param_key(k)
+                    if norm_k in ema_map:
+                        real_k = ema_map[norm_k]
+                        if ema_target[real_k].shape == v.shape:
+                            clean_ema[real_k] = v
+                ema.ema_model.load_state_dict(clean_ema, strict=strict)
 
     if optimizer is not None:
         opt_path = os.path.join(checkpoint_dir, "optimizer.pt")
@@ -268,23 +276,17 @@ def load_pixel_weights(
         state_dict = state_dict["state_dict"]
 
     target_state = model.state_dict()
+    target_key_map = {_normalize_param_key(k): k for k in target_state.keys()}
     pixel_dict = {}
 
     for k, v in state_dict.items():
-        clean_k = k.replace("_orig_mod.", "")
-        parts = set(clean_k.split("."))
+        norm_k = _normalize_param_key(k)
+        parts = set(norm_k.split("."))
         if not (parts & PIXEL_EXPLICIT_MODULES):
             continue
 
-        target_key = None
-        if clean_k in target_state:
-            target_key = clean_k
-        elif f"unet.{clean_k}" in target_state:
-            target_key = f"unet.{clean_k}"
-        elif clean_k.startswith("unet.") and clean_k[5:] in target_state:
-            target_key = clean_k[5:]
-
-        if target_key is not None:
+        if norm_k in target_key_map:
+            target_key = target_key_map[norm_k]
             if target_state[target_key].shape != v.shape:
                 raise ValueError(
                     f"Shape mismatch for pixel layer '{target_key}': "
@@ -302,22 +304,24 @@ def load_pixel_weights(
     logging.info(f"Loaded {len(pixel_dict)} pixel adaptation layers successfully.")
 
     if ema is not None and getattr(ema, "ema_model", None) is not None:
+        ema_target = ema.ema_model.state_dict()
+        ema_key_map = {_normalize_param_key(k): k for k in ema_target.keys()}
         ema_path = os.path.join(checkpoint_dir, "ema_model.safetensors")
-        if os.path.exists(ema_path):
-            ema_dict = load_file(ema_path)
-            clean_ema = {}
-            for k, v in ema_dict.items():
-                clean_k = k.replace("_orig_mod.", "")
-                if set(clean_k.split(".")) & PIXEL_EXPLICIT_MODULES:
-                    target_key = None
-                    if clean_k in target_state:
-                        target_key = clean_k
-                    elif f"unet.{clean_k}" in target_state:
-                        target_key = f"unet.{clean_k}"
-                    elif clean_k.startswith("unet.") and clean_k[5:] in target_state:
-                        target_key = clean_k[5:]
-                    if target_key is not None:
-                        clean_ema[target_key] = v
+        source_dict = load_file(ema_path) if os.path.exists(ema_path) else state_dict
+        if "ema_model" in source_dict:
+            source_dict = source_dict["ema_model"]
+        elif "model" in source_dict:
+            source_dict = source_dict["model"]
+
+        clean_ema = {}
+        for k, v in source_dict.items():
+            norm_k = _normalize_param_key(k)
+            if set(norm_k.split(".")) & PIXEL_EXPLICIT_MODULES:
+                if norm_k in ema_key_map:
+                    target_k = ema_key_map[norm_k]
+                    if ema_target[target_k].shape == v.shape:
+                        clean_ema[target_k] = v
+        if clean_ema:
             ema.ema_model.load_state_dict(clean_ema, strict=False)
         else:
             ema.ema_model.load_state_dict(pixel_dict, strict=False)

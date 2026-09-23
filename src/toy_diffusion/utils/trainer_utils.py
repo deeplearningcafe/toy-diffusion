@@ -45,15 +45,8 @@ from toy_diffusion.paths.scheduler import LinearSchedule, DDPMSchedule, VESchedu
 from toy_diffusion.utils.checkpointing import (
     load_checkpoint_vocab,
     PIXEL_EXPLICIT_MODULES,
+    _normalize_param_key,
 )
-
-
-def _normalize_param_key(k: str) -> str:
-    """Removes torch.compile wrappers and module prefixes for matching."""
-    k = k.replace("_orig_mod.", "")
-    if k.startswith("unet."):
-        k = k[5:]
-    return k
 
 
 def get_model(config, device):

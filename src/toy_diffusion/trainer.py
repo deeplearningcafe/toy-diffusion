@@ -154,7 +154,7 @@ class Trainer:
 
         self.start_epoch = 0
         resume_dir = config.get("resume_from_checkpoint", None)
-        pixel_ckpt = config.get("pixel_checkpoint", None)
+        pixel_dir = config.get("pixel_dir", None)
         if resume_dir is not None:
             ignore_scheduler = self.config.get(
                 "ignore_checkpoint_scheduler", False
@@ -167,7 +167,7 @@ class Trainer:
                 scheduler=None if ignore_scheduler else self.scheduler,
                 ema=self.ema,
                 skip_text_enc=True if config.get("hf_text_encoder", None) else False,
-                pixel_checkpoint=pixel_ckpt,
+                pixel_dir=pixel_dir,
             )
             if ignore_scheduler or ignore_optimizer:
                 skip_warmup = self.config.get("skip_warmup", False)
@@ -191,7 +191,7 @@ class Trainer:
                         skip_text_enc=True
                         if config.get("hf_text_encoder", None)
                         else False,
-                        pixel_checkpoint=pixel_ckpt,
+                        pixel_dir=pixel_dir,
                     )
                 torch.cuda.empty_cache()
             if ckpt_vocab and "vocab" not in self.config:
@@ -212,8 +212,8 @@ class Trainer:
             6 if not self.config.get("use_gradient_checkpointing", False) else 7
         )
 
-        if config.get("use_gradient_checkpointing", False):
-            patch_unsloth_smart_gradient_checkpointing(dtype=torch.bfloat16)
+        # if config.get("use_gradient_checkpointing", False):
+        # patch_unsloth_smart_gradient_checkpointing(dtype=torch.bfloat16)
 
         if hasattr(torch, "compile") and config.get("compile_model", True):
             logging.info("Compiling model with torch.compile for faster training...")
