@@ -46,6 +46,7 @@ from toy_diffusion.utils.checkpointing import (
     load_checkpoint_vocab,
     PIXEL_EXPLICIT_MODULES,
     _normalize_param_key,
+    adapt_patch_embed_weight,
 )
 
 
@@ -541,8 +542,19 @@ def load_latent_to_pixel_weights(
         norm_k = _normalize_param_key(k)
         if norm_k in target_key_map:
             real_target_k = target_key_map[norm_k]
-            if target_state[real_target_k].shape == v.shape:
+            target_p = target_state[real_target_k]
+            if target_p.shape == v.shape:
                 filtered_dict[real_target_k] = v
+            elif "x_embedder.weight" in norm_k or "conv_in.weight" in norm_k:
+                try:
+                    filtered_dict[real_target_k] = adapt_patch_embed_weight(
+                        v, target_p.shape
+                    )
+                    logging.info(
+                        f"Adapted '{real_target_k}' from {v.shape} to {target_p.shape}."
+                    )
+                except ValueError as e:
+                    skipped_keys.append((k, str(e)))
             else:
                 skipped_keys.append(
                     (

@@ -41,7 +41,7 @@ def run_anime_faces_experiment(args):
         logging.info("--> Activating PIXEL-SPACE adaptation mode <--")
         config["is_latents"] = False
         config["use_pixel_decoder"] = True
-        config["patch_size"] = 16
+        config["patch_size"] = config.get("patch_size", 16)
         config["in_channels"] = 3
         config["out_channels"] = 3
         # x-prediction strictly outperforms v-prediction

@@ -565,7 +565,10 @@ class DualStreamDiT(nn.Module):
 
         if self.pixel_decoder is not None:
             num_patches = h_patches * w_patches
+            k = self.patch_size // 16
             s_cond = s.reshape(bsz * num_patches, self.hidden_size, 1, 1)
+            if k > 1:
+                s_cond = s_cond.expand(-1, -1, k, k)
 
             # Extract patches: [B, C, H, W] -> [B * N, C, P, P]
             x_patches = (

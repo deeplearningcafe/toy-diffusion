@@ -4,6 +4,7 @@ import logging
 import torch
 import torch.nn as nn
 from safetensors.torch import save_file, load_file
+import math
 
 PIXEL_EXPLICIT_MODULES = {
     "x_embedder",
@@ -22,6 +23,46 @@ def _normalize_param_key(k: str) -> str:
     if k.startswith("unet."):
         k = k[5:]
     return k
+
+
+def adapt_patch_embed_weight(
+    src_weight: torch.Tensor,
+    target_shape: tuple[int, ...],
+) -> torch.Tensor:
+    """
+    Adapts patch embedding weights when expanding patch size (e.g. ps16->ps32).
+    Follows Jiang et al. (2026): W' = (1/k) * [W, ..., W], replicating
+    kernel weights across sub-patches to preserve output variance.
+    """
+    if src_weight.shape == target_shape:
+        return src_weight
+
+    # 4D Conv2d weights: [out_channels, in_channels, kh, kw]
+    if src_weight.ndim == 4 and len(target_shape) == 4:
+        k_h = target_shape[2] // src_weight.shape[2]
+        k_w = target_shape[3] // src_weight.shape[3]
+        if (
+            k_h == k_w
+            and k_h > 1
+            and target_shape[2] == src_weight.shape[2] * k_h
+            and target_shape[3] == src_weight.shape[3] * k_w
+        ):
+            return src_weight.repeat(1, 1, k_h, k_w) / float(k_h)
+
+    # 2D Linear weights: [hidden_size, in_channels * p^2]
+    if src_weight.ndim == 2 and len(target_shape) == 2:
+        ratio = target_shape[1] // src_weight.shape[1]
+        k = int(math.isqrt(ratio))
+        if k * k == ratio and k > 1:
+            d, in_features = src_weight.shape
+            p_old = int(math.isqrt(in_features // 3))
+            w_2d = src_weight.view(d, 3, p_old, p_old)
+            w_tiled = w_2d.repeat(1, 1, k, k) / float(k)
+            return w_tiled.reshape(d, target_shape[1])
+
+    raise ValueError(
+        f"Cannot adapt patch embed weight from {src_weight.shape} to {target_shape}."
+    )
 
 
 def save_checkpoint(
@@ -194,8 +235,20 @@ def load_from_checkpoint(
                 norm_k = _normalize_param_key(k)
                 if norm_k in target_map:
                     real_k = target_map[norm_k]
-                    if target_state[real_k].shape == v.shape:
+                    target_p = target_state[real_k]
+                    if target_p.shape == v.shape:
                         sanitized_dict[real_k] = v
+                    elif "x_embedder.weight" in norm_k or "conv_in.weight" in norm_k:
+                        try:
+                            sanitized_dict[real_k] = adapt_patch_embed_weight(
+                                v, target_p.shape
+                            )
+                            logging.info(
+                                f"Adapted '{real_k}' from {v.shape} to "
+                                f"{target_p.shape}."
+                            )
+                        except ValueError as e:
+                            logging.warning(f"Skipping adaptation for '{real_k}': {e}")
             model.load_state_dict(sanitized_dict, strict=strict)
 
         if pixel_dir is not None:
@@ -215,8 +268,18 @@ def load_from_checkpoint(
                     norm_k = _normalize_param_key(k)
                     if norm_k in ema_map:
                         real_k = ema_map[norm_k]
-                        if ema_target[real_k].shape == v.shape:
+                        target_p = ema_target[real_k]
+                        if target_p.shape == v.shape:
                             clean_ema[real_k] = v
+                        elif (
+                            "x_embedder.weight" in norm_k or "conv_in.weight" in norm_k
+                        ):
+                            try:
+                                clean_ema[real_k] = adapt_patch_embed_weight(
+                                    v, target_p.shape
+                                )
+                            except ValueError:
+                                pass
                 ema.ema_model.load_state_dict(clean_ema, strict=strict)
 
     if optimizer is not None:
@@ -287,7 +350,16 @@ def load_pixel_weights(
 
         if norm_k in target_key_map:
             target_key = target_key_map[norm_k]
-            if target_state[target_key].shape != v.shape:
+            target_p = target_state[target_key]
+            if target_p.shape == v.shape:
+                pixel_dict[target_key] = v
+            elif "x_embedder.weight" in norm_k or "conv_in.weight" in norm_k:
+                pixel_dict[target_key] = adapt_patch_embed_weight(v, target_p.shape)
+                logging.info(
+                    f"Adapted pixel weight '{target_key}' from {v.shape} "
+                    f"to {target_p.shape}."
+                )
+            else:
                 raise ValueError(
                     f"Shape mismatch for pixel layer '{target_key}': "
                     f"model {target_state[target_key].shape} vs "
@@ -319,8 +391,14 @@ def load_pixel_weights(
             if set(norm_k.split(".")) & PIXEL_EXPLICIT_MODULES:
                 if norm_k in ema_key_map:
                     target_k = ema_key_map[norm_k]
-                    if ema_target[target_k].shape == v.shape:
+                    target_p = ema_target[target_k]
+                    if target_p.shape == v.shape:
                         clean_ema[target_k] = v
+                    elif "x_embedder.weight" in norm_k or "conv_in.weight" in norm_k:
+                        clean_ema[target_k] = adapt_patch_embed_weight(
+                            v, target_p.shape
+                        )
+
         if clean_ema:
             ema.ema_model.load_state_dict(clean_ema, strict=False)
         else:
