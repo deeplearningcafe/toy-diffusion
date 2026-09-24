@@ -129,6 +129,9 @@ def evaluate_model(
         logging.info(f"Saved variance histogram to {hist_path}")
 
     real_data_path = trainer.config["data_path"]
+    if isinstance(real_data_path, (list, tuple)):
+        # Benchmark against the primary real dataset, not the synthetic mix
+        real_data_path = real_data_path[0]
     logging.info(f"Computing FID between {real_data_path} and {temp_gen_dir}")
 
     temp_real_dir = None

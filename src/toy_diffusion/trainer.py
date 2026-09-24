@@ -645,6 +645,7 @@ class Trainer:
                     sampler_type=self.config.get("sampler_type", "ddim"),
                     shift=self.config.get("sample_shift", 1.0),
                     clip_prediction=self.config.get("clip_prediction", False),
+                    noise_scale=self.config.get("noise_scale", 1.0),
                     cm_steps=self.config.get("cm_steps", 4),
                     ddgan_steps=self.config.get("ddgan_steps", 4),
                 )

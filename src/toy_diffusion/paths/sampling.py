@@ -98,6 +98,8 @@ def sample_euler(
     return_traj=False,
     perturb_t: float = None,
     perturb_scale: float = 0.0,
+    clip_prediction: bool = False,
+    noise_scale: float = 1.0,
 ):
     """
     Euler ODE Solver.
@@ -142,11 +144,18 @@ def sample_euler(
             x.view(view_shape) for x in schedule.get_coefficients(t_input)
         ]
 
+        if noise_scale != 1.0:
+            sigma = sigma * noise_scale
+            d_sigma = d_sigma * noise_scale
+
         if prediction_target == "v":
             v = pred
 
         # using the standard x0
         elif prediction_target == "x":
+            # Bound x0 to valid image space
+            if clip_prediction:
+                pred = pred.clamp(-1.0, 1.0)
             # v = d_alpha * x + d_sigma * eps
             # eps = (z - alpha * x) / sigma
             sigma_safe = sigma.clamp(min=1e-5)
@@ -165,6 +174,8 @@ def sample_euler(
 
             alpha_safe = alpha.clamp(min=1e-5)
             x_recon = (z - sigma * pred) / alpha_safe
+            if clip_prediction:
+                x_recon = x_recon.clamp(-1.0, 1.0)
             v = d_alpha * x_recon + d_sigma * pred
 
         # Euler Step
@@ -175,6 +186,9 @@ def sample_euler(
             if projection_matrix is not None:
                 current_z = current_z @ projection_matrix
             traj.append(current_z)
+
+    if clip_prediction:
+        z = z.clamp(-1.0, 1.0)
 
     # Project back if necessary
     if projection_matrix is not None:
@@ -853,6 +867,8 @@ def generate_samples(
     vae_scale: float = 1.0,
     vae_shift: float = 0.0,
     vae_batch_size: int = 32,
+    noise_scale: float = 1.0,
+    clip_prediction: bool = False,
     **kwargs,
 ):
     """
@@ -862,7 +878,7 @@ def generate_samples(
     # --- Prepare Noise ---
     if x is None:
         shape = (batch_size, *data_shape)
-        x = torch.randn(shape, device=device)
+        x = torch.randn(shape, device=device) * noise_scale
 
     # 2. Model Wrapper
     model_wrapper = CFGModelWrapper(
@@ -873,10 +889,14 @@ def generate_samples(
         attention_mask=attention_mask,
     )
     # parse the kwargs as each func has own signature
-    extra_kwargs = {}
-    extra_kwargs["perturb_t"] = kwargs.get("perturb_t", None)
-    extra_kwargs["perturb_scale"] = kwargs.get("perturb_scale", 0.0)
-    extra_kwargs["shift"] = kwargs.get("shift", 1.0)
+    extra_kwargs = {
+        "perturb_t": kwargs.get("perturb_t", None),
+        "perturb_scale": kwargs.get("perturb_scale", 0.0),
+        "shift": kwargs.get("shift", 1.0),
+        "clip_prediction": clip_prediction,
+        "noise_scale": noise_scale,
+    }
+
     # 3. Call specific sampler
     if diffusion_type == "linear":
         samples = sample_euler(
