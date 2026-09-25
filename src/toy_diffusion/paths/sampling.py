@@ -3,6 +3,38 @@ import numpy as np
 import math
 
 
+def apply_dynamic_threshold(
+    pred_x: torch.Tensor,
+    percentile: float = 0.995,
+    max_val: float = 1.0,
+) -> torch.Tensor:
+    """
+    Applies Imagen-style dynamic thresholding across spatial dimensions
+    to preserve chromaticity ratios and prevent color gamut burn.
+    Supports arbitrary tensor dimensions (2D, 3D, 4D).
+    """
+    if not (0.0 < percentile <= 1.0):
+        return pred_x.clamp(-max_val, max_val)
+
+    orig_dtype = pred_x.dtype
+    bsz = pred_x.shape[0]
+    # Flatten spatial and channel dimensions per batch item: [B, -1]
+    flat = pred_x.detach().abs().reshape(bsz, -1)
+
+    num_elements = flat.shape[1]
+    k = min(num_elements, max(1, int(num_elements * percentile)))
+
+    # Compute k-th value along dimension 1 (1-based index)
+    s = torch.kthvalue(flat, k, dim=1).values
+    s = torch.clamp(s, min=max_val)
+
+    # Dynamic reshape preserves compatibility across [B, C, H, W] and [B, D]
+    view_shape = (bsz,) + (1,) * (pred_x.ndim - 1)
+    s = s.view(view_shape).to(orig_dtype)
+
+    return (pred_x / s).clamp(-max_val, max_val)
+
+
 class CFGModelWrapper:
     """
     Wraps the model to handle Classifier-Free Guidance (CFG) and unconditional forward passes.
@@ -15,15 +47,19 @@ class CFGModelWrapper:
         cfg_scale=1.0,
         is_conditional=False,
         attention_mask=None,
+        cfg_interval=(0.0, 1.0),
     ):
         self.model = model
         self.embeddings = embeddings
         self.cfg_scale = cfg_scale
         self.is_conditional = is_conditional
         self.attention_mask = attention_mask
+        self.cfg_interval = tuple(cfg_interval)
 
     def __call__(self, x: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
-        if self.is_conditional and self.cfg_scale > 1.0 and self.embeddings is not None:
+        in_interval = self.cfg_interval[0] <= t[0].item() <= self.cfg_interval[1]
+        active_cfg = self.cfg_scale if in_interval else 1.0
+        if self.is_conditional and active_cfg > 1.0 and self.embeddings is not None:
             # CFG: Double the batch
             x_in = torch.cat([x] * 2)
             t_in = torch.cat([t] * 2)
@@ -34,13 +70,14 @@ class CFGModelWrapper:
                 attention_mask=self.attention_mask,
             )
             out_uncond, out_cond = out.chunk(2)
-            return out_uncond + self.cfg_scale * (out_cond - out_uncond)
-        elif self.is_conditional:
+            return out_uncond + active_cfg * (out_cond - out_uncond)
+        elif self.is_conditional and self.embeddings is not None:
+            bs = x.shape[0]
             return self.model["unet"](
                 x,
                 t,
-                encoder_hidden_states=self.embeddings,
-                attention_mask=self.attention_mask,
+                encoder_hidden_states=self.embeddings[bs:],
+                attention_mask=self.attention_mask[bs:],
             )
         else:
             if isinstance(self.model, (dict, torch.nn.ModuleDict)):
@@ -100,6 +137,7 @@ def sample_euler(
     perturb_scale: float = 0.0,
     clip_prediction: bool = False,
     noise_scale: float = 1.0,
+    dynamic_thresholding: bool = False,
 ):
     """
     Euler ODE Solver.
@@ -154,8 +192,11 @@ def sample_euler(
         # using the standard x0
         elif prediction_target == "x":
             # Bound x0 to valid image space
-            if clip_prediction:
+            if dynamic_thresholding:
+                pred = apply_dynamic_threshold(pred)
+            elif clip_prediction:
                 pred = pred.clamp(-1.0, 1.0)
+
             # v = d_alpha * x + d_sigma * eps
             # eps = (z - alpha * x) / sigma
             sigma_safe = sigma.clamp(min=1e-5)
@@ -887,6 +928,7 @@ def generate_samples(
         cfg_scale=cfg_scale,
         is_conditional=is_conditional,
         attention_mask=attention_mask,
+        cfg_interval=kwargs.get("cfg_interval", (0.0, 1.0)),
     )
     # parse the kwargs as each func has own signature
     extra_kwargs = {
@@ -895,6 +937,7 @@ def generate_samples(
         "shift": kwargs.get("shift", 1.0),
         "clip_prediction": clip_prediction,
         "noise_scale": noise_scale,
+        "dynamic_thresholding": kwargs.get("dynamic_thresholding", False),
     }
 
     # 3. Call specific sampler

@@ -648,6 +648,14 @@ class Trainer:
                     noise_scale=self.config.get("noise_scale", 1.0),
                     cm_steps=self.config.get("cm_steps", 4),
                     ddgan_steps=self.config.get("ddgan_steps", 4),
+                    cfg_interval=self.config.get(
+                        "cfg_interval",
+                        [0.11, 0.97] if not self.is_latents else [0.0, 1.0],
+                    ),
+                    dynamic_thresholding=self.config.get(
+                        "dynamic_thresholding",
+                        not self.is_latents,
+                    ),
                 )
 
         if return_traj or force_traj:
