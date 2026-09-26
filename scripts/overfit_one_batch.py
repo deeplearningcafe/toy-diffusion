@@ -157,7 +157,8 @@ def run_overfit_batch_experiment(args):
     )
     logging.info(f"Image Shape: {data_shape}")
 
-    pred_target = config["loss_target"]
+    config["resume_from_checkpoint"] = None
+    pred_target = config.get("prediction_target", config.get("loss_target", "v"))
     trainer = Trainer(config, prediction_target=pred_target, dataset=batch_dataset)
     # we need to change the prompts to use the ones sampled
     # TODO: implement a method in the dataset to return prompts, not using the tensors_list

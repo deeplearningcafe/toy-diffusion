@@ -571,6 +571,7 @@ class DualStreamDiT(nn.Module):
                 s_cond = s_cond.expand(-1, -1, k, k)
 
             # Extract patches: [B, C, H, W] -> [B * N, C, P, P]
+            # TODO: chunk this
             x_patches = (
                 x.view(bsz, self.in_channels, h_patches, p, w_patches, p)
                 .permute(0, 2, 4, 1, 3, 5)

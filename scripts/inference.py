@@ -84,6 +84,11 @@ def main():
         help="Port to run the Gradio server on",
     )
     parser.add_argument(
+        "--share",
+        action="store_true",
+        help="Enable public Gradio share link",
+    )
+    parser.add_argument(
         "opts",
         nargs=argparse.REMAINDER,
         help="Override config parameters",
@@ -97,6 +102,8 @@ def main():
     cfg = OmegaConf.merge(base_conf, cli_conf)
     timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
 
+    ckpt_cfg = {}
+    ckpt_vocab = None
     if args.checkpoint_dir is not None:
         cfg.training.resume_from_checkpoint = args.checkpoint_dir
         ckpt_cfg = load_checkpoint_config(args.checkpoint_dir)
@@ -121,6 +128,17 @@ def main():
         **OmegaConf.to_container(cfg.sampling),
         "device": device,
     }
+
+    if ckpt_cfg:
+        for k, v in ckpt_cfg.items():
+            if k not in ["device"]:
+                config[k] = v
+
+    is_latents = config.get("is_latents", False)
+    if not is_latents:
+        config["in_channels"] = 3
+        config["out_channels"] = 3
+
     print(config)
 
     # Setup seed
@@ -132,7 +150,7 @@ def main():
     # Initialize VAE parameters
     vae_scale = 1.0
     vae_shift = 0.0
-    if config.get("is_latents", False) and "vae_pretrained" in config:
+    if is_latents and "vae_pretrained" in config:
         vae_config = AutoencoderKL.load_config(config["vae_pretrained"])
         vae_scale = vae_config.get("scaling_factor", 1.0)
         vae_shift = vae_config.get("shift_factor", 0.0)
@@ -188,7 +206,7 @@ def main():
             default_batch_size=args.batch_size,
             output_dir=output_dir,
         )
-        demo.launch(server_port=args.port, share=False)
+        demo.launch(server_port=args.port, share=args.share)
     else:
         print("Running CLI inference...")
         images = generate_images_custom(

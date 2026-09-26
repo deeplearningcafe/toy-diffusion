@@ -7,6 +7,7 @@ import logging
 from datetime import datetime
 from omegaconf import OmegaConf
 from diffusers import AutoencoderKL
+import torch.multiprocessing as mp
 
 from toy_diffusion.trainer import Trainer
 from toy_diffusion.data.image import ImageDataset
@@ -39,6 +40,10 @@ def run_evaluation(args):
     if "seed" in config:
         torch.manual_seed(config["seed"])
         np.random.seed(config["seed"])
+
+    # resume only from provided dir
+    config["latent_checkpoint"] = None
+    config["pixel_dir"] = None
 
     base_ckpt = os.path.normpath(args.checkpoint_dir)
     epoch_name = os.path.basename(base_ckpt)
@@ -145,6 +150,18 @@ def run_evaluation(args):
 
 
 if __name__ == "__main__":
+    # Force 'fork' on Linux to prevent Python 3.14 forkserver crash
+    # with DataLoader workers (PyTorch reduction rebuild_storage_fd EINVAL)
+    try:
+        mp.set_start_method("fork", force=True)
+    except RuntimeError:
+        pass
+
+    try:
+        mp.set_sharing_strategy("file_system")
+    except RuntimeError:
+        pass
+
     parser = argparse.ArgumentParser(description="Evaluate Checkpoint FID.")
     parser.add_argument(
         "--config",

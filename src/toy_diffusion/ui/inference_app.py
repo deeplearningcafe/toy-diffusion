@@ -10,6 +10,7 @@ from PIL import Image
 from PIL.PngImagePlugin import PngInfo
 from toy_diffusion.paths.sampling import generate_samples
 
+
 def make_image_grid(images, rows=None, cols=None):
     """Combines a list of PIL Images into a single grid Image."""
     if not images:
@@ -19,17 +20,18 @@ def make_image_grid(images, rows=None, cols=None):
         cols = int(math.ceil(math.sqrt(n)))
     if rows is None:
         rows = int(math.ceil(n / cols))
-        
+
     w, h = images[0].size
     grid_w = cols * w
     grid_h = rows * h
     grid_img = Image.new("RGB", (grid_w, grid_h))
-    
+
     for i, img in enumerate(images):
         x = (i % cols) * w
         y = (i // cols) * h
         grid_img.paste(img, (x, y))
     return grid_img
+
 
 def generate_images_custom(
     trainer,
@@ -41,6 +43,11 @@ def generate_images_custom(
     batch_size,
     seed,
     output_dir=None,
+    noise_scale=None,
+    dynamic_thresholding=None,
+    clip_prediction=None,
+    shift=None,
+    cfg_interval=None,
 ):
     """Custom batch generator supporting prompt saving and metadata."""
     if seed is not None and seed >= 0:
@@ -52,10 +59,11 @@ def generate_images_custom(
         torch.manual_seed(seed)
         np.random.seed(seed)
         random.seed(seed)
-        
+
     device = trainer.device
     is_conditional = trainer.conditional
-    
+    is_latents = getattr(trainer, "is_latents", trainer.config.get("is_latents", False))
+
     if hasattr(trainer.dataset, "P") and trainer.dataset.P is not None:
         D = trainer.dataset[0].shape[-1]
         if isinstance(trainer.dataset[0], (tuple, list)):
@@ -66,6 +74,32 @@ def generate_images_custom(
             data_shape = list(trainer.dataset[0][0].shape)
         else:
             data_shape = list(trainer.dataset[0].shape)
+
+    # Resolve pixel vs latent sampling parameters with config fallbacks
+    res_noise_scale = (
+        noise_scale
+        if noise_scale is not None
+        else trainer.config.get("noise_scale", 1.0)
+    )
+    res_dyn_thresh = (
+        dynamic_thresholding
+        if dynamic_thresholding is not None
+        else trainer.config.get("dynamic_thresholding", not is_latents)
+    )
+    res_clip_pred = (
+        clip_prediction
+        if clip_prediction is not None
+        else trainer.config.get("clip_prediction", False)
+    )
+    res_shift = shift if shift is not None else trainer.config.get("sample_shift", 1.0)
+    res_cfg_interval = (
+        cfg_interval
+        if cfg_interval is not None
+        else trainer.config.get(
+            "cfg_interval",
+            [0.11, 0.97] if not is_latents else [0.0, 1.0],
+        )
+    )
 
     embeddings = None
     attention_mask = None
@@ -79,51 +113,37 @@ def generate_images_custom(
             text_enc.shuffle = False
             text_enc.cfg_dropout_prob = 0.0
             text_enc.tag_dropout_prob = 0.0
-            
+
         positive_prompts = [prompt] * num_samples
         negative_prompts = [neg_prompt] * num_samples
         full_prompts = (
-            negative_prompts + positive_prompts
-            if cfg_scale > 1.0
-            else positive_prompts
+            negative_prompts + positive_prompts if cfg_scale > 1.0 else positive_prompts
         )
-        
+
         with torch.no_grad():
-            embeddings, attention_mask = trainer.model["text_enc"](
-                full_prompts
-            )
+            embeddings, attention_mask = trainer.model["text_enc"](full_prompts)
 
     trainer.model.eval()
     all_images = []
-    
+
     for i in range(0, num_samples, batch_size):
         curr_batch_size = min(batch_size, num_samples - i)
         curr_embeddings = None
         curr_attention_mask = None
-        
+
         if is_conditional and embeddings is not None:
             if cfg_scale > 1.0:
                 neg_slice = embeddings[:num_samples][i : i + curr_batch_size]
                 pos_slice = embeddings[num_samples:][i : i + curr_batch_size]
                 curr_embeddings = torch.cat([neg_slice, pos_slice], dim=0)
-                
-                neg_mask_slice = (
-                    attention_mask[:num_samples]
-                    [i : i + curr_batch_size]
-                )
-                pos_mask_slice = (
-                    attention_mask[num_samples:]
-                    [i : i + curr_batch_size]
-                )
-                curr_attention_mask = torch.cat(
-                    [neg_mask_slice, pos_mask_slice], dim=0
-                )
+
+                neg_mask_slice = attention_mask[:num_samples][i : i + curr_batch_size]
+                pos_mask_slice = attention_mask[num_samples:][i : i + curr_batch_size]
+                curr_attention_mask = torch.cat([neg_mask_slice, pos_mask_slice], dim=0)
             else:
                 curr_embeddings = embeddings[i : i + curr_batch_size]
-                curr_attention_mask = (
-                    attention_mask[i : i + curr_batch_size]
-                )
-                
+                curr_attention_mask = attention_mask[i : i + curr_batch_size]
+
         with torch.no_grad():
             with torch.autocast(
                 device_type=device,
@@ -136,9 +156,7 @@ def generate_images_custom(
                     batch_size=curr_batch_size,
                     data_shape=data_shape,
                     x=None,
-                    diffusion_type=trainer.config.get(
-                        "schedule_type", "linear"
-                    ),
+                    diffusion_type=trainer.config.get("schedule_type", "linear"),
                     prediction_target=trainer.prediction_target,
                     num_steps=steps,
                     cfg_scale=cfg_scale,
@@ -147,64 +165,66 @@ def generate_images_custom(
                     is_conditional=is_conditional,
                     projection_matrix=getattr(trainer.dataset, "P", None),
                     return_traj=False,
-                    vae=trainer.vae,
+                    vae=trainer.vae if is_latents else None,
                     device=device,
                     vae_scale=trainer.config.get("vae_scale", 1.0),
                     vae_shift=trainer.config.get("vae_shift", 0.0),
                     vae_batch_size=32,
                     sampler_type=trainer.config.get("sampler_type", "ddim"),
-                    shift=trainer.config.get("sample_shift", 1.0),
-                    clip_prediction=trainer.config.get(
-                        "clip_prediction", False
-                    ),
+                    shift=res_shift,
+                    clip_prediction=res_clip_pred,
+                    noise_scale=res_noise_scale,
+                    dynamic_thresholding=res_dyn_thresh,
+                    cfg_interval=res_cfg_interval,
                 )
-                
+
         samples = np.clip((samples + 1.0) / 2.0, 0.0, 1.0)
         if samples.ndim == 4 and samples.shape[1] in [1, 3, 4]:
             samples = np.transpose(samples, (0, 2, 3, 1))
-            
+
         for j in range(samples.shape[0]):
             img_np = (samples[j] * 255.0).astype(np.uint8)
             if img_np.shape[-1] == 1:
                 img_np = img_np.squeeze(-1)
             all_images.append(Image.fromarray(img_np))
-            
+
     grid_img = make_image_grid(all_images)
-    
+
     # Save individual and grid images with metadata
     if output_dir:
         os.makedirs(output_dir, exist_ok=True)
         timestamp = int(time.time() * 1000)
-        
+
         meta_payload = {
             "prompt": prompt,
             "neg_prompt": neg_prompt,
             "steps": steps,
             "cfg_scale": cfg_scale,
             "seed": seed,
-            "checkpoint": (
-                trainer.config.get("resume_from_checkpoint") or "base"
-            ),
+            "is_latents": is_latents,
+            "noise_scale": res_noise_scale,
+            "dynamic_thresholding": res_dyn_thresh,
+            "clip_prediction": res_clip_pred,
+            "sample_shift": res_shift,
+            "cfg_interval": res_cfg_interval,
+            "checkpoint": (trainer.config.get("resume_from_checkpoint") or "base"),
             "schedule_type": trainer.config.get("schedule_type", "linear"),
             "prediction_target": trainer.prediction_target,
         }
         meta_str = json.dumps(meta_payload)
         png_info = PngInfo()
         png_info.add_text("parameters", meta_str)
-        
+
         for idx, img in enumerate(all_images):
-            img_path = os.path.join(
-                output_dir, f"sample_{timestamp}_{idx}.png"
-            )
+            img_path = os.path.join(output_dir, f"sample_{timestamp}_{idx}.png")
             img.save(img_path, pnginfo=png_info)
-            
+
         if grid_img is not None:
-            grid_path = os.path.join(
-                output_dir, f"grid_{timestamp}.png"
-            )
+            grid_path = os.path.join(output_dir, f"grid_{timestamp}.png")
             grid_img.save(grid_path, pnginfo=png_info)
-            
+
     return [grid_img] + all_images if grid_img is not None else all_images
+
 
 def read_metadata(image):
     """Helper to parse custom json parameter string from PNG metadata."""
@@ -220,6 +240,7 @@ def read_metadata(image):
         raw_data = image.info.get("parameters", "None")
         return f"Raw parameters:\n{raw_data}"
 
+
 def send_to_generation(image):
     """Parses data dictionary to restore UI values."""
     if image is None:
@@ -229,16 +250,17 @@ def send_to_generation(image):
         if not parameters:
             return [gr.skip()] * 5
         data = json.loads(parameters)
-        
+
         p = data.get("prompt", gr.skip())
         np_ = data.get("neg_prompt", gr.skip())
         s = data.get("steps", gr.skip())
         c = data.get("cfg_scale", gr.skip())
         sd = data.get("seed", gr.skip())
-        
+
         return [p, np_, s, c, sd]
     except Exception:
         return [gr.skip()] * 5
+
 
 def create_inference_ui(
     trainer,
@@ -249,6 +271,14 @@ def create_inference_ui(
     default_batch_size,
     output_dir,
 ):
+    is_latents = getattr(trainer, "is_latents", trainer.config.get("is_latents", False))
+    # Scale default CFG appropriately: pixel models require lower CFG scale
+    adjusted_default_cfg = (
+        default_cfg
+        if is_latents
+        else trainer.config.get("cfg_scale", min(default_cfg, 2.5))
+    )
+
     theme = gr.themes.Soft(
         primary_hue="blue",
         neutral_hue="slate",
@@ -262,10 +292,13 @@ def create_inference_ui(
 
     js_func = "document.body.classList.toggle('dark', true);"
 
-    with gr.Blocks(
-        title="Diffusion Inference", theme=theme, js=js_func
-    ) as demo:
-        gr.Markdown("# 🌌 Text-to-Image Generation (Flow Matching vs DDPM)")
+    with gr.Blocks(title="Diffusion Inference", theme=theme, js=js_func) as demo:
+        mode_str = "Latent Space" if is_latents else "Pixel Space (Direct)"
+        gr.Markdown(
+            f"# 🌌 Diffusion Inference ({mode_str})\n"
+            f"Target: `{trainer.prediction_target}` | "
+            f"Schedule: `{trainer.config.get('schedule_type', 'linear')}`"
+        )
 
         with gr.Tabs():
             with gr.Tab("Generation"):
@@ -280,10 +313,10 @@ def create_inference_ui(
                         neg_prompt = gr.Textbox(
                             value=default_neg_prompt,
                             label="Negative Prompt",
-                            placeholder="Enter your negative prompt here...",
+                            placeholder="Enter negative prompt...",
                             lines=2,
                         )
-                        
+
                         with gr.Row():
                             steps = gr.Slider(
                                 minimum=1,
@@ -295,11 +328,39 @@ def create_inference_ui(
                             cfg = gr.Slider(
                                 minimum=1.0,
                                 maximum=20.0,
-                                value=default_cfg,
-                                step=0.5,
+                                value=adjusted_default_cfg,
+                                step=0.25,
                                 label="CFG Scale",
                             )
-                        
+
+                        with gr.Row():
+                            noise_scale = gr.Slider(
+                                minimum=0.5,
+                                maximum=4.0,
+                                value=trainer.config.get("noise_scale", 1.0),
+                                step=0.1,
+                                label="Noise Scale",
+                            )
+                            shift = gr.Slider(
+                                minimum=1.0,
+                                maximum=5.0,
+                                value=trainer.config.get("sample_shift", 1.0),
+                                step=0.1,
+                                label="Time Shift",
+                            )
+
+                        with gr.Row():
+                            dynamic_thresh = gr.Checkbox(
+                                value=trainer.config.get(
+                                    "dynamic_thresholding", not is_latents
+                                ),
+                                label="Dynamic Thresholding (Imagen)",
+                            )
+                            clip_pred = gr.Checkbox(
+                                value=trainer.config.get("clip_prediction", False),
+                                label="Static Clip [-1, 1]",
+                            )
+
                         with gr.Row():
                             num_samples = gr.Slider(
                                 minimum=1,
@@ -315,22 +376,20 @@ def create_inference_ui(
                                 step=1,
                                 label="Batch Size",
                             )
-                        
+
                         seed = gr.Number(
                             value=-1,
                             label="Seed (-1 for random)",
                             precision=0,
                         )
-                        
+
                         output_dir = gr.Textbox(
                             value=output_dir,
                             label="Output Directory",
                             placeholder="results/inference",
                         )
-                        
-                        generate_btn = gr.Button(
-                            "Generate Images", variant="primary"
-                        )
+
+                        generate_btn = gr.Button("Generate Images", variant="primary")
 
                     with gr.Column(scale=1):
                         gallery = gr.Gallery(
@@ -366,6 +425,10 @@ def create_inference_ui(
             batch_size_val,
             seed_val,
             out_dir_val,
+            noise_scale_val,
+            shift_val,
+            dynamic_thresh_val,
+            clip_pred_val,
         ):
             return generate_images_custom(
                 trainer=trainer,
@@ -377,6 +440,10 @@ def create_inference_ui(
                 batch_size=int(batch_size_val),
                 seed=int(seed_val),
                 output_dir=out_dir_val,
+                noise_scale=float(noise_scale_val),
+                shift=float(shift_val),
+                dynamic_thresholding=bool(dynamic_thresh_val),
+                clip_prediction=bool(clip_pred_val),
             )
 
         generate_btn.click(
@@ -390,6 +457,10 @@ def create_inference_ui(
                 batch_size,
                 seed,
                 output_dir,
+                noise_scale,
+                shift,
+                dynamic_thresh,
+                clip_pred,
             ],
             outputs=[gallery],
         )
@@ -408,3 +479,4 @@ def create_inference_ui(
         )
 
     return demo
+
